@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environments
+venv/
+.venv/
+.env
+
+# Carries the real DB password; only the .example is committed.
+scripts/init_db.sql
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/
+*.log
+
+# Editors
+.idea/
+.vscode/

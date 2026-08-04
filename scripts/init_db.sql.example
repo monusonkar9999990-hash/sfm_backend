@@ -1,0 +1,26 @@
+-- SFM database bootstrap template. Copy to scripts/init_db.sql, replace the
+-- password placeholder, then run once as root:
+--
+--     mysql -u root -p < scripts\init_db.sql
+--
+-- The same password goes into DB_PASSWORD in .env.
+
+CREATE DATABASE IF NOT EXISTS sfm_db
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+
+CREATE USER IF NOT EXISTS 'sfm_user'@'localhost'
+    IDENTIFIED BY '<strong-password>';
+CREATE USER IF NOT EXISTS 'sfm_user'@'127.0.0.1'
+    IDENTIFIED BY '<strong-password>';
+
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, REFERENCES
+    ON sfm_db.* TO 'sfm_user'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, REFERENCES
+    ON sfm_db.* TO 'sfm_user'@'127.0.0.1';
+
+-- The test runner creates and drops its own copy of the schema.
+GRANT ALL PRIVILEGES ON `test\_sfm\_db`.* TO 'sfm_user'@'localhost';
+GRANT ALL PRIVILEGES ON `test\_sfm\_db`.* TO 'sfm_user'@'127.0.0.1';
+
+FLUSH PRIVILEGES;
