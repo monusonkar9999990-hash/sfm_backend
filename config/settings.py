@@ -115,6 +115,7 @@ THIRD_PARTY_APPS = [
 
 LOCAL_APPS = [
     'accounts',
+    'attendance',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -358,6 +359,33 @@ SIMPLE_JWT = {
 
     'JTI_CLAIM': 'jti',
 }
+
+
+# --------------------------------------------------------------------------
+# Attendance
+# --------------------------------------------------------------------------
+# Field policy, not code: an administrator changes these without a release.
+
+# A punch-in at or after this local hour counts as late.
+ATTENDANCE_LATE_HOUR = env_int('ATTENDANCE_LATE_HOUR', 10)
+
+# A punch without a selfie is refused. Kept switchable for pilots where the
+# camera permission has not been rolled out yet.
+ATTENDANCE_SELFIE_REQUIRED = env_bool('ATTENDANCE_SELFIE_REQUIRED', True)
+
+# Off by default: a punch outside every fence is stored and flagged rather
+# than refused, because field staff legitimately start the day at a customer
+# site. Turn it on for office-bound teams.
+ATTENDANCE_ENFORCE_GEOFENCE = env_bool('ATTENDANCE_ENFORCE_GEOFENCE', False)
+
+# A GPS fix worse than this is not worth recording — at 500 m of uncertainty
+# the geofence result means nothing.
+ATTENDANCE_MAX_ACCURACY_METERS = env_int('ATTENDANCE_MAX_ACCURACY_METERS', 100)
+
+# How stale a punch captured offline may be when it finally syncs, and how
+# far ahead of the server a device's clock may run.
+ATTENDANCE_MAX_BACKDATE_DAYS = env_int('ATTENDANCE_MAX_BACKDATE_DAYS', 7)
+ATTENDANCE_CLOCK_SKEW_MINUTES = env_int('ATTENDANCE_CLOCK_SKEW_MINUTES', 5)
 
 
 # --------------------------------------------------------------------------

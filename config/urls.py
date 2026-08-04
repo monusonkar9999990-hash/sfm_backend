@@ -17,6 +17,7 @@ urlpatterns = [
     # With the version hardcoded in the path, the versioning class is
     # configured but never actually consulted.
     path('api/<version>/auth/', include('accounts.urls')),
+    path('api/<version>/attendance/', include('attendance.urls')),
 ]
 
 if settings.DEBUG:
