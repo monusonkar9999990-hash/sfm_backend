@@ -233,9 +233,22 @@ DATABASES = {
 # --------------------------------------------------------------------------
 # Authentication
 # --------------------------------------------------------------------------
-# Decide this BEFORE the first `migrate`. Swapping the user model afterwards
-# means rebuilding the database. Uncomment once accounts.User exists:
-# AUTH_USER_MODEL = 'accounts.User'
+# Set before the first migration, which is the only moment this is cheap.
+# USERNAME_FIELD on this model is the employee code; signing in with an email
+# address or a mobile number is handled by IdentifierBackend below.
+AUTH_USER_MODEL = 'accounts.User'
+
+AUTHENTICATION_BACKENDS = [
+    'accounts.backends.IdentifierBackend',
+    # Kept as a fallback so the Django admin still authenticates if the custom
+    # backend is ever disabled.
+    'django.contrib.auth.backends.ModelBackend',
+]
+
+# Mobile numbers are stored in E.164. These two let someone type just their
+# national number at the login screen.
+DEFAULT_COUNTRY_CODE = env('DEFAULT_COUNTRY_CODE', '+91')
+NATIONAL_NUMBER_LENGTH = env_int('NATIONAL_NUMBER_LENGTH', 10)
 
 AUTH_PASSWORD_VALIDATORS = [
     {
