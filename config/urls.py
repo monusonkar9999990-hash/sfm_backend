@@ -18,6 +18,7 @@ urlpatterns = [
     # configured but never actually consulted.
     path('api/<version>/auth/', include('accounts.urls')),
     path('api/<version>/attendance/', include('attendance.urls')),
+    path('api/<version>/beats/', include('beats.urls')),
 ]
 
 if settings.DEBUG:
