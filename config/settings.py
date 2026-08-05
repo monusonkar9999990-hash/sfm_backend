@@ -107,6 +107,7 @@ DJANGO_APPS = [
 ]
 
 THIRD_PARTY_APPS = [
+    'corsheaders',
     'rest_framework',
     # Stores refresh tokens that have been rotated or logged out, so a stolen
     # refresh token can be revoked before it expires.
@@ -124,8 +125,9 @@ INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
-    # 'corsheaders.middleware.CorsMiddleware',  # add once django-cors-headers
-    # is installed and the mobile client calls a different origin.
+    # Above CommonMiddleware, which is where the docs put it: a preflight has
+    # to be answered before anything else decides to redirect it.
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -363,6 +365,24 @@ SIMPLE_JWT = {
 
     'JTI_CLAIM': 'jti',
 }
+
+
+# --------------------------------------------------------------------------
+# Cross-origin requests
+# --------------------------------------------------------------------------
+# A native Android or iOS build never sends an Origin header, so none of this
+# applies to it. It exists for the Flutter web build and for anyone calling
+# the API from a browser tool.
+
+CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS')
+
+# Flutter web picks a random port on every `flutter run`, which no fixed
+# allow-list can keep up with. Wide open in development, explicit in
+# production — and the guard is DEBUG, not a separate flag somebody can
+# forget to turn off.
+CORS_ALLOW_ALL_ORIGINS = DEBUG
+
+CORS_ALLOW_CREDENTIALS = False
 
 
 # --------------------------------------------------------------------------
