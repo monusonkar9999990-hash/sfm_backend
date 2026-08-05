@@ -14,7 +14,7 @@ from django.test import TestCase
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
 
-from .models import Department, Role, Territory, UserTerritory
+from .models import Department, InviteRequest, Role, Territory, UserTerritory
 
 User = get_user_model()
 
@@ -332,3 +332,162 @@ class ReportingLineTests(TestCase):
         self.c.refresh_from_db()
         self.assertTrue(self.c.manager_path.startswith(f'/{self.b.pk}/'))
         self.assertEqual(list(self.a.subordinates), [])
+
+
+class InviteRequestTests(APITestCase):
+    """The one endpoint open to the internet, so the tests care as much about
+    what it refuses to reveal as about what it records."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.existing = User.objects.create_user(
+            'sfm-9001',
+            'Already Here',
+            email='already@corp.com',
+            mobile='+919876511111',
+            password=PASSWORD,
+            status=User.Status.ACTIVE,
+        )
+
+    def setUp(self):
+        cache.clear()
+
+    def url(self):
+        return reverse('accounts:request-invite', kwargs={'version': 'v1'})
+
+    def payload(self, **overrides):
+        body = {
+            'full_name': 'Kiran Rao',
+            'employee_code': 'sfm-0142',
+            'email': 'kiran.rao@corp.com',
+            'mobile': '+919876500099',
+            'message': 'Joined the Pune team last week.',
+        }
+        body.update(overrides)
+        return {k: v for k, v in body.items() if v is not None}
+
+    # ------------------------------------------------------------- recording
+
+    def test_a_request_is_recorded_without_creating_anything(self):
+        response = self.client.post(self.url(), self.payload(), format='json')
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+        invite = InviteRequest.objects.get()
+        self.assertEqual(invite.employee_code, 'SFM-0142')
+        self.assertEqual(invite.email, 'kiran.rao@corp.com')
+        self.assertEqual(invite.status, InviteRequest.Status.PENDING)
+        # No account, and nothing that could be used to sign in.
+        self.assertFalse(User.objects.filter(employee_code='SFM-0142').exists())
+        self.assertNotIn('access', response.data)
+
+    def test_no_authentication_is_needed(self):
+        self.client.credentials()
+        self.assertEqual(
+            self.client.post(self.url(), self.payload(), format='json').status_code,
+            status.HTTP_202_ACCEPTED,
+        )
+
+    # --------------------------------------------------------- no enumeration
+
+    def test_an_existing_account_gets_the_same_answer(self):
+        fresh = self.client.post(self.url(), self.payload(), format='json')
+        cache.clear()
+        taken = self.client.post(
+            self.url(),
+            self.payload(employee_code='SFM-9001', email='already@corp.com'),
+            format='json',
+        )
+
+        # Byte for byte the same reply — the caller cannot learn who is
+        # already registered.
+        self.assertEqual(taken.status_code, fresh.status_code)
+        self.assertEqual(taken.data, fresh.data)
+        # And nothing was recorded for the person who already has an account.
+        self.assertEqual(InviteRequest.objects.count(), 1)
+
+    def test_a_second_request_from_the_same_person_is_not_duplicated(self):
+        self.client.post(self.url(), self.payload(), format='json')
+        cache.clear()
+        again = self.client.post(self.url(), self.payload(), format='json')
+
+        self.assertEqual(again.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(InviteRequest.objects.count(), 1)
+
+    # ------------------------------------------------------------- validation
+
+    def test_a_malformed_employee_code_is_refused(self):
+        response = self.client.post(
+            self.url(), self.payload(employee_code='has space'), format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('employee_code', response.data)
+
+    def test_a_mobile_outside_e164_is_refused(self):
+        response = self.client.post(
+            self.url(), self.payload(mobile='9876500099'), format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_a_request_with_no_way_to_reply_is_refused(self):
+        response = self.client.post(
+            self.url(), self.payload(email='', mobile=''), format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_the_endpoint_is_throttled(self):
+        for _ in range(5):
+            self.client.post(self.url(), self.payload(), format='json')
+        self.assertEqual(
+            self.client.post(self.url(), self.payload(), format='json').status_code,
+            status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
+    # ---------------------------------------------------------------- review
+
+    def test_approving_creates_an_invited_user_who_cannot_sign_in_yet(self):
+        self.client.post(self.url(), self.payload(), format='json')
+        invite = InviteRequest.objects.get()
+
+        user = invite.approve(reviewed_by=self.existing, note='Confirmed with HR')
+
+        self.assertEqual(user.employee_code, 'SFM-0142')
+        self.assertEqual(user.status, User.Status.INVITED)
+        self.assertFalse(user.is_active, 'invited is not active')
+        self.assertFalse(user.has_usable_password())
+
+        invite.refresh_from_db()
+        self.assertEqual(invite.status, InviteRequest.Status.APPROVED)
+        self.assertEqual(invite.created_user, user)
+        self.assertEqual(invite.reviewed_by, self.existing)
+        self.assertIsNotNone(invite.reviewed_at)
+
+    def test_a_request_cannot_be_reviewed_twice(self):
+        self.client.post(self.url(), self.payload(), format='json')
+        invite = InviteRequest.objects.get()
+        invite.approve(reviewed_by=self.existing)
+
+        with self.assertRaises(DjangoValidationError):
+            invite.approve(reviewed_by=self.existing)
+        with self.assertRaises(DjangoValidationError):
+            invite.reject(reviewed_by=self.existing)
+
+    def test_rejecting_leaves_no_account_behind(self):
+        self.client.post(self.url(), self.payload(), format='json')
+        invite = InviteRequest.objects.get()
+
+        invite.reject(reviewed_by=self.existing, note='Not on the HR list')
+
+        invite.refresh_from_db()
+        self.assertEqual(invite.status, InviteRequest.Status.REJECTED)
+        self.assertIsNone(invite.created_user)
+        self.assertFalse(User.objects.filter(employee_code='SFM-0142').exists())
+
+    def test_once_approved_the_person_can_request_again_only_as_a_new_row(self):
+        # An approved request no longer blocks the "one open request" rule,
+        # but the account now exists, so nothing new is recorded either.
+        self.client.post(self.url(), self.payload(), format='json')
+        InviteRequest.objects.get().approve(reviewed_by=self.existing)
+        cache.clear()
+
+        self.client.post(self.url(), self.payload(), format='json')
+        self.assertEqual(InviteRequest.objects.count(), 1)

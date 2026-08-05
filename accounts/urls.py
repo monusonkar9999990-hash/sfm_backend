@@ -8,6 +8,7 @@ from .views import (
     LoginView,
     LogoutView,
     RefreshTokenView,
+    RequestInviteView,
 )
 
 app_name = 'accounts'
@@ -18,4 +19,5 @@ urlpatterns = [
     path('logout/', LogoutView.as_view(), name='logout'),
     path('me/', CurrentUserView.as_view(), name='me'),
     path('change-password/', ChangePasswordView.as_view(), name='change-password'),
+    path('request-invite/', RequestInviteView.as_view(), name='request-invite'),
 ]

@@ -5,6 +5,8 @@ serializers exist to validate credentials and to shape the user payload the
 mobile client reads.
 """
 
+import re
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -13,9 +15,16 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import BusinessPermission
+from django.db.models import Q
+
+from .models import BusinessPermission, InviteRequest
 
 User = get_user_model()
+
+# The same shapes the User model enforces, so a request that would be
+# impossible to approve is refused at the door.
+EMPLOYEE_CODE = re.compile(r'^[A-Z0-9][A-Z0-9\-/]{1,19}$')
+E164 = re.compile(r'^\+[1-9]\d{7,14}$')
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -196,3 +205,77 @@ class LogoutSerializer(serializers.Serializer):
                 'Token blacklisting is not enabled on this server.'
             )
         return self.token
+
+
+class InviteRequestSerializer(serializers.Serializer):
+    """Validates someone asking to be given an account.
+
+    Deliberately says nothing about whether the person is already registered.
+    An endpoint that answers "that email already has an account" is a free
+    directory of who works here, and this one is open to the internet.
+    """
+
+    full_name = serializers.CharField(max_length=150)
+    employee_code = serializers.CharField(max_length=20)
+    email = serializers.EmailField(max_length=254, required=False, allow_blank=True)
+    mobile = serializers.CharField(max_length=16, required=False, allow_blank=True)
+    message = serializers.CharField(
+        max_length=1000, required=False, allow_blank=True, default=''
+    )
+
+    def validate_employee_code(self, value):
+        code = value.strip().upper()
+        if not EMPLOYEE_CODE.match(code):
+            raise serializers.ValidationError(
+                'Use letters, digits, hyphen or slash, e.g. SFM-0142.'
+            )
+        return code
+
+    def validate_mobile(self, value):
+        mobile = value.strip()
+        if mobile and not E164.match(mobile):
+            raise serializers.ValidationError('Use E.164 format, e.g. +919876543210.')
+        return mobile
+
+    def validate(self, attrs):
+        if not attrs.get('email') and not attrs.get('mobile'):
+            raise serializers.ValidationError(
+                {'email': 'Give an email address or a mobile number so we can reply.'}
+            )
+        attrs['full_name'] = attrs['full_name'].strip()
+        return attrs
+
+    def record(self):
+        """Records the request, unless there is nothing to record.
+
+        Returns `None` when the person already has an account or already has a
+        request waiting. The view answers the same either way — the caller
+        cannot tell which happened, which is the point.
+
+        Not named `create`: DRF's `save()` asserts that `create()` returns an
+        object, and "deliberately recorded nothing" is a legitimate outcome
+        here.
+        """
+        validated_data = self.validated_data
+        email = (validated_data.get('email') or '').strip().lower()
+        mobile = (validated_data.get('mobile') or '').strip()
+        code = validated_data['employee_code']
+
+        already_a_user = User.objects.filter(
+            Q(employee_code__iexact=code)
+            | (Q(email__iexact=email) if email else Q(pk__in=[]))
+            | (Q(mobile=mobile) if mobile else Q(pk__in=[]))
+        ).exists()
+        if already_a_user:
+            return None
+
+        if InviteRequest.open_for(code, email, mobile) is not None:
+            return None
+
+        return InviteRequest.objects.create(
+            full_name=validated_data['full_name'],
+            employee_code=code,
+            email=email,
+            mobile=mobile,
+            message=validated_data.get('message', ''),
+        )

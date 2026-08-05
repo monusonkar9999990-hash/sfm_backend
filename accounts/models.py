@@ -9,9 +9,10 @@ that changing an HR field never touches the authentication table.
 import uuid
 from pathlib import Path
 
+from django.conf import settings
 from django.contrib.auth.models import AbstractBaseUser, Group, PermissionsMixin
-from django.core.validators import RegexValidator
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 from django.db import models, transaction
 from django.utils import timezone
 
@@ -521,3 +522,133 @@ class UserTerritory(TimeStampedUUIDModel):
                     pk=self.pk
                 ).update(is_primary=False)
             super().save(*args, **kwargs)
+
+
+class InviteRequest(TimeStampedUUIDModel):
+    """Someone asking to be given an account.
+
+    The product is invite-only: an administrator creates users, and a person
+    who downloads the app cannot sign themselves up. This is the queue that
+    sits in front of that decision — it grants nothing on its own, it only
+    tells an administrator that somebody is waiting.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        REJECTED = 'rejected', 'Rejected'
+
+    full_name = models.CharField(max_length=150)
+
+    # What the requester says their HR code is. Unverified until an
+    # administrator approves, which is the whole point of the review.
+    employee_code = models.CharField(max_length=20)
+    email = models.EmailField(max_length=254, blank=True, default='')
+    mobile = models.CharField(max_length=16, blank=True, default='')
+    message = models.TextField(
+        blank=True,
+        default='',
+        help_text='Anything the requester wants the administrator to know.',
+    )
+
+    status = models.CharField(
+        max_length=10, choices=Status, default=Status.PENDING
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='reviewed_invite_requests',
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_note = models.CharField(max_length=255, blank=True, default='')
+
+    # Set when an approval turns this row into a real account, so the trail
+    # from request to user survives.
+    created_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='invite_request',
+    )
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['status', '-created_at']),
+            models.Index(fields=['employee_code']),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(email='') | ~models.Q(mobile=''),
+                name='invite_request_has_a_contact',
+            )
+        ]
+
+    def __str__(self):
+        return f'{self.employee_code} {self.full_name} ({self.status})'
+
+    @property
+    def is_pending(self):
+        return self.status == self.Status.PENDING
+
+    def save(self, *args, **kwargs):
+        self.employee_code = self.employee_code.strip().upper()
+        self.full_name = self.full_name.strip()
+        self.email = self.email.strip().lower()
+        self.mobile = self.mobile.strip()
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def open_for(cls, employee_code='', email='', mobile=''):
+        """An existing pending request for the same person, if there is one.
+
+        "One open request per person" cannot be a partial unique index —
+        MySQL has none — so it is a lookup here and a check in the serializer.
+        """
+        query = models.Q(employee_code=employee_code.strip().upper())
+        if email:
+            query |= models.Q(email=email.strip().lower())
+        if mobile:
+            query |= models.Q(mobile=mobile.strip())
+        return cls.objects.filter(query, status=cls.Status.PENDING).first()
+
+    @transaction.atomic
+    def approve(self, reviewed_by=None, note=''):
+        """Turns the request into an invited user.
+
+        The account is created with an unusable password, which is exactly the
+        state `create_user` leaves an invited user in — they set one through
+        the invite, nobody sets one for them.
+        """
+        if not self.is_pending:
+            raise ValidationError('This request has already been reviewed.')
+
+        User = self.__class__._meta.apps.get_model('accounts', 'User')
+        user = User.objects.create_user(
+            employee_code=self.employee_code,
+            full_name=self.full_name,
+            email=self.email or None,
+            mobile=self.mobile or None,
+            password=None,
+            status=User.Status.INVITED,
+        )
+
+        self.status = self.Status.APPROVED
+        self.reviewed_by = reviewed_by
+        self.reviewed_at = timezone.now()
+        self.review_note = note
+        self.created_user = user
+        self.save()
+        return user
+
+    def reject(self, reviewed_by=None, note=''):
+        if not self.is_pending:
+            raise ValidationError('This request has already been reviewed.')
+        self.status = self.Status.REJECTED
+        self.reviewed_by = reviewed_by
+        self.reviewed_at = timezone.now()
+        self.review_note = note
+        self.save()

@@ -19,6 +19,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .serializers import (
     ChangePasswordSerializer,
+    InviteRequestSerializer,
     LoginSerializer,
     LogoutSerializer,
     UserSerializer,
@@ -161,3 +162,45 @@ class LogoutView(GenericAPIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(status=status.HTTP_205_RESET_CONTENT)
+
+
+class RequestInviteView(GenericAPIView):
+    """Ask an administrator for an account.
+
+    This product is invite-only: nobody signs themselves up. The endpoint
+    records a request and grants nothing — no account, no token, no hint that
+    the request went anywhere except into a queue.
+
+    The reply is identical whether the request was recorded, the person
+    already has an account, or they already have a request waiting. An
+    endpoint open to the internet that distinguishes those cases is a
+    directory of who works here.
+
+    **Request**
+    `{"full_name": "…", "employee_code": "SFM-0142", "email": "…",
+      "mobile": "+919876543210", "message": "…"}`
+
+    **Responses**
+    * `202` — the request was received (whatever happened behind it)
+    * `400` — a field is missing or malformed
+    * `429` — too many requests from this client
+    """
+
+    serializer_class = InviteRequestSerializer
+    permission_classes = [AllowAny]
+    throttle_scope = 'invite'
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.record()
+
+        return Response(
+            {
+                'detail': (
+                    'Thanks — your request has been sent to an administrator. '
+                    'You will hear from them once it has been reviewed.'
+                )
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )

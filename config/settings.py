@@ -316,6 +316,9 @@ REST_FRAMEWORK = {
         # Reserved for the sign-in and OTP views built in the next step.
         'login': env('THROTTLE_LOGIN', '10/min'),
         'otp': env('THROTTLE_OTP', '5/min'),
+        # An invite request is a once-in-a-career action, so the ceiling is
+        # low enough to make a flood of them pointless.
+        'invite': env('THROTTLE_INVITE', '5/hour'),
     },
     'DEFAULT_VERSIONING_CLASS': 'rest_framework.versioning.URLPathVersioning',
     'DEFAULT_VERSION': 'v1',

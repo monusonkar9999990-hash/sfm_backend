@@ -5,11 +5,21 @@ The stock UserAdmin is reused rather than replaced, so password hashing, the
 layout changes, because this user model has no username.
 """
 
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import UserChangeForm, UserCreationForm
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError
 
-from .models import Department, Designation, Role, Territory, User, UserTerritory
+from .models import (
+    Department,
+    Designation,
+    InviteRequest,
+    Role,
+    Territory,
+    User,
+    UserTerritory,
+)
 
 
 class SFMUserCreationForm(UserCreationForm):
@@ -142,3 +152,88 @@ class TerritoryAdmin(admin.ModelAdmin):
     search_fields = ('name', 'code')
     autocomplete_fields = ('parent',)
     readonly_fields = ('path',)
+
+
+@admin.register(InviteRequest)
+class InviteRequestAdmin(admin.ModelAdmin):
+    """The queue an administrator works through.
+
+    Approving is the only way an account comes into existence from a request,
+    and it happens here rather than through an API — there is no endpoint that
+    turns a stranger into a user.
+    """
+
+    list_display = (
+        'employee_code',
+        'full_name',
+        'email',
+        'mobile',
+        'status',
+        'created_at',
+        'reviewed_by',
+    )
+    list_filter = ('status', 'created_at')
+    search_fields = ('employee_code', 'full_name', 'email', 'mobile')
+    date_hierarchy = 'created_at'
+    readonly_fields = (
+        'full_name',
+        'employee_code',
+        'email',
+        'mobile',
+        'message',
+        'status',
+        'reviewed_by',
+        'reviewed_at',
+        'created_user',
+        'created_at',
+        'updated_at',
+    )
+    actions = ['approve_selected', 'reject_selected']
+
+    def has_add_permission(self, request):
+        # Requests arrive from the endpoint, not from this form.
+        return False
+
+    @admin.action(description='Approve — create an invited user')
+    def approve_selected(self, request, queryset):
+        created, skipped = 0, 0
+        for invite in queryset:
+            if not invite.is_pending:
+                skipped += 1
+                continue
+            try:
+                invite.approve(reviewed_by=request.user)
+                created += 1
+            except (ValidationError, IntegrityError) as exc:
+                # One bad row must not stop the rest of the batch.
+                self.message_user(
+                    request,
+                    f'{invite.employee_code}: {exc}',
+                    level=messages.ERROR,
+                )
+        if created:
+            self.message_user(
+                request,
+                f'{created} account{"" if created == 1 else "s"} created and '
+                'invited.',
+                level=messages.SUCCESS,
+            )
+        if skipped:
+            self.message_user(
+                request,
+                f'{skipped} request{"" if skipped == 1 else "s"} were already '
+                'reviewed and were left alone.',
+                level=messages.WARNING,
+            )
+
+    @admin.action(description='Reject')
+    def reject_selected(self, request, queryset):
+        rejected = 0
+        for invite in queryset.filter(status=InviteRequest.Status.PENDING):
+            invite.reject(reviewed_by=request.user)
+            rejected += 1
+        self.message_user(
+            request,
+            f'{rejected} request{"" if rejected == 1 else "s"} rejected.',
+            level=messages.SUCCESS,
+        )
