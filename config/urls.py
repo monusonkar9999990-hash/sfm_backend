@@ -19,6 +19,7 @@ urlpatterns = [
     path('api/<version>/auth/', include('accounts.urls')),
     path('api/<version>/attendance/', include('attendance.urls')),
     path('api/<version>/beats/', include('beats.urls')),
+    path('api/<version>/site-visits/', include('sitevisits.urls')),
 ]
 
 if settings.DEBUG:

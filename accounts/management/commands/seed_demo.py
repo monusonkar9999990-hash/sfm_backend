@@ -26,6 +26,7 @@ from accounts.models import (
 )
 from attendance.models import GeoFence
 from beats.models import Beat, BeatOutlet
+from sitevisits.models import Site
 
 User = get_user_model()
 
@@ -136,6 +137,7 @@ class Command(BaseCommand):
         )
 
         self._geofence(territories['NZ-DEL'])
+        self._sites(territories['DEL'])
         self._beat(assigned_to=User.objects.get(employee_code='SFM-0002'),
                    territory=territories['DEL'])
 
@@ -264,6 +266,37 @@ class Command(BaseCommand):
             user=user, territory=territory, defaults={'is_primary': True}
         )
         return user
+
+    def _sites(self, territory):
+        rows = [
+            ('SITE-01', 'Green Valley Apartments', 'cus_1',
+             'Shree Balaji Traders', 'Plot 14, Sector 62', 'Noida',
+             'structure', '28.612900', '77.229500'),
+            ('SITE-02', 'Riverfront Villas', 'cus_2', 'Verma Hardware',
+             '8, Yamuna Bank Road', 'New Delhi', 'foundation',
+             '28.656200', '77.241000'),
+            # Deliberately unplotted: a site added from the office before
+            # anyone has stood on it, which the check-in has to cope with.
+            ('SITE-03', 'Sunrise Row Houses', 'cus_3',
+             'Gupta Building Material', '22, Pusa Road', 'New Delhi',
+             'brickwork', None, None),
+        ]
+        for code, name, ref, customer, address, city, stage, lat, lng in rows:
+            site, created = Site.objects.get_or_create(
+                code=code,
+                defaults={
+                    'name': name,
+                    'customer_ref': ref,
+                    'customer_name': customer,
+                    'address': address,
+                    'city': city,
+                    'stage': stage,
+                    'latitude': lat,
+                    'longitude': lng,
+                    'territory': territory,
+                },
+            )
+            self._say('site', site.name, created)
 
     def _geofence(self, territory):
         fence, created = GeoFence.objects.get_or_create(

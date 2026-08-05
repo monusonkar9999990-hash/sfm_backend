@@ -118,6 +118,7 @@ LOCAL_APPS = [
     'accounts',
     'attendance',
     'beats',
+    'sitevisits',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
