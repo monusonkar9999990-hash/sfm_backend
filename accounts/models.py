@@ -11,6 +11,7 @@ from pathlib import Path
 
 from django.contrib.auth.models import AbstractBaseUser, Group, PermissionsMixin
 from django.core.validators import RegexValidator
+from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils import timezone
 
@@ -399,6 +400,7 @@ class User(AbstractBaseUser, PermissionsMixin):
             or requested_fields is None
             or 'reporting_manager' in requested_fields
         ):
+            self._guard_manager_cycle()
             parent_path = (
                 self.reporting_manager.manager_path if self.reporting_manager_id else '/'
             )
@@ -422,6 +424,31 @@ class User(AbstractBaseUser, PermissionsMixin):
 
         if requested_fields is None or 'role' in requested_fields:
             self._sync_role_group()
+
+    def _guard_manager_cycle(self):
+        """Refuse a reporting line that loops back to this user.
+
+        A CHECK constraint stops someone being their own manager, but the
+        database cannot see A -> B -> A. Left alone it does not raise: the
+        paths quietly rewrite each other until this user appears inside its
+        own ancestor chain, and from then on every "everyone under me" query
+        answers wrongly. Better to refuse the save.
+        """
+        seen = {self.pk}
+        manager = self.reporting_manager
+        while manager is not None:
+            if manager.pk in seen:
+                raise ValidationError(
+                    {
+                        'reporting_manager': (
+                            'That would create a loop in the reporting line — '
+                            f'{manager.full_name or manager.employee_code} already '
+                            'reports to this user, directly or through someone else.'
+                        )
+                    }
+                )
+            seen.add(manager.pk)
+            manager = manager.reporting_manager
 
     def _sync_role_group(self):
         """Put the user in the Group that carries their role's permissions.

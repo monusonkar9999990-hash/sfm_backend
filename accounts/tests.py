@@ -7,8 +7,10 @@ runner — the working schema and its data are never touched.
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.core.cache import cache
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.urls import reverse
 from rest_framework import status
+from django.test import TestCase
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
 
@@ -262,3 +264,71 @@ class AuthEndpointTests(APITestCase):
             format='json',
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class ReportingLineTests(TestCase):
+    """The manager chain is a tree; anything that would make it a ring is
+    refused before it can corrupt the materialised paths."""
+
+    def setUp(self):
+        self.a = User.objects.create_user(
+            'sfm-a', 'Ay One', email='a@corp.com',
+            mobile='+919000000001', password=PASSWORD,
+        )
+        self.b = User.objects.create_user(
+            'sfm-b', 'Bee Two', email='b@corp.com',
+            mobile='+919000000002', password=PASSWORD,
+        )
+        self.c = User.objects.create_user(
+            'sfm-c', 'Cee Three', email='c@corp.com',
+            mobile='+919000000003', password=PASSWORD,
+        )
+
+    def test_a_straight_chain_builds_its_paths(self):
+        self.b.reporting_manager = self.a
+        self.b.save()
+        self.c.reporting_manager = self.b
+        self.c.save()
+
+        self.assertEqual(
+            {u.employee_code for u in self.a.subordinates}, {'SFM-B', 'SFM-C'}
+        )
+        self.assertEqual({u.employee_code for u in self.b.subordinates}, {'SFM-C'})
+        self.assertEqual(list(self.c.subordinates), [])
+
+    def test_a_two_step_loop_is_refused(self):
+        self.b.reporting_manager = self.a
+        self.b.save()
+
+        self.a.reporting_manager = self.b
+        with self.assertRaises(DjangoValidationError):
+            self.a.save()
+
+        # And nothing was written: A is still at the top of its own chain.
+        self.a.refresh_from_db()
+        self.assertIsNone(self.a.reporting_manager)
+        self.assertEqual(self.a.manager_path, f'/{self.a.pk}/')
+
+    def test_a_longer_loop_is_refused(self):
+        self.b.reporting_manager = self.a
+        self.b.save()
+        self.c.reporting_manager = self.b
+        self.c.save()
+
+        self.a.reporting_manager = self.c
+        with self.assertRaises(DjangoValidationError):
+            self.a.save()
+
+    def test_moving_a_manager_restamps_the_branch_below(self):
+        self.b.reporting_manager = self.a
+        self.b.save()
+        self.c.reporting_manager = self.b
+        self.c.save()
+
+        # B moves out from under A; C must travel with it.
+        self.b.reporting_manager = None
+        self.b.save()
+
+        self.c.refresh_from_db()
+        self.assertTrue(self.c.manager_path.startswith(f'/{self.b.pk}/'))
+        self.assertEqual(list(self.a.subordinates), [])
