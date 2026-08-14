@@ -206,8 +206,13 @@ TEMPLATES = [
 
 
 # --------------------------------------------------------------------------
-# Database — MySQL
+# Database — MySQL, or Postgres through DATABASE_URL
 # --------------------------------------------------------------------------
+# Read first because it decides which of the two blocks below applies. A
+# managed platform hands out one connection string; a laptop and a VPS use the
+# DB_* settings and MySQL.
+DATABASE_URL = env('DATABASE_URL', '')
+
 # Requires MySQL 8.0.11+ (Django 6 minimum) and the mysqlclient driver.
 #
 # Server-side setup, run once. The application must not connect as root:
@@ -221,10 +226,15 @@ TEMPLATES = [
 #   FLUSH PRIVILEGES;
 
 db_password = env('DB_PASSWORD', '')
-if not db_password and not DEBUG:
+if not db_password and not DEBUG and not DATABASE_URL:
     # A blank password reaching production means the .env never got deployed.
+    #
+    # Skipped when DATABASE_URL is set: the credentials are inside that string,
+    # and demanding DB_PASSWORD as well means a Postgres deployment refuses to
+    # start over a MySQL setting it will never read.
     raise ImproperlyConfigured(
-        'DB_PASSWORD must be set when DJANGO_DEBUG is off.'
+        'DB_PASSWORD must be set when DJANGO_DEBUG is off. '
+        '(Not needed when DATABASE_URL carries the credentials.)'
     )
 
 
@@ -301,8 +311,6 @@ def _database_from_url(url):
         'OPTIONS': {'sslmode': env('DB_SSL_MODE', '') or 'require'},
     }
 
-
-DATABASE_URL = env('DATABASE_URL', '')
 
 DATABASES = {
     'default': _database_from_url(DATABASE_URL) if DATABASE_URL else {
