@@ -7,7 +7,10 @@
 # that belongs in the image that runs in production.
 
 # --- build ----------------------------------------------------------------
-FROM python:3.13-slim AS build
+# 3.14, not 3.13. Every model's primary key defaults to `uuid.uuid7`, which
+# only exists from Python 3.14 — on 3.13 the image builds cleanly and then dies
+# on the first import with "module 'uuid' has no attribute 'uuid7'".
+FROM python:3.14-slim AS build
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -30,7 +33,9 @@ RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install -r requirements.txt
 
 # --- run ------------------------------------------------------------------
-FROM python:3.13-slim
+# Must match the build stage: the virtualenv copied across is tied to the
+# interpreter's minor version.
+FROM python:3.14-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
