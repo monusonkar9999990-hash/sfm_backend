@@ -1,0 +1,75 @@
+# Render blueprint for the SFM API.
+#
+# Docker rather than Render's Python runtime, for one concrete reason:
+# `requirements.txt` still carries `mysqlclient`, which needs the MySQL client
+# headers and a compiler to build. The Dockerfile installs them; Render's
+# Python image does not. The same Dockerfile is what runs under Compose, so
+# what is tested locally is what runs here.
+#
+# The database is Postgres because Render offers no managed MySQL. Nothing in
+# the project is MySQL-specific — `DATABASE_URL` switches the engine, and with
+# it unset a laptop keeps using MySQL through the DB_* settings.
+
+services:
+  - type: web
+    name: sfm-api
+    runtime: docker
+    plan: free
+    # Closest region to the field team this serves.
+    region: singapore
+    autoDeploy: true
+    # The same endpoint the container's own HEALTHCHECK uses. It touches the
+    # database, so an instance whose Postgres has gone is reported unhealthy
+    # rather than quietly answering 500s.
+    healthCheckPath: /api/v1/health/
+    envVars:
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_DEBUG
+        value: "False"
+      - key: DJANGO_TIME_ZONE
+        value: Asia/Kolkata
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sfm-db
+          property: connectionString
+      # There is no nginx here, so the application process serves its own
+      # static files. Without this the admin and the API docs render unstyled.
+      - key: SERVE_STATIC_FILES
+        value: "True"
+      # Render's proxy is not on localhost, so gunicorn has to be told to trust
+      # the forwarded headers it sends — otherwise every request is logged as
+      # coming from the proxy and `SECURE_PROXY_SSL_HEADER` never fires.
+      - key: GUNICORN_FORWARDED_ALLOW_IPS
+        value: "*"
+      # Two workers of eight threads on a free instance. Threads rather than
+      # processes because this app waits on the database and on writing
+      # uploaded photos, and because the live-updates socket holds a polling
+      # request open for up to 25 seconds — with two plain workers, two
+      # watching browsers would be the whole server.
+      - key: GUNICORN_WORKERS
+        value: "2"
+      - key: GUNICORN_THREADS
+        value: "8"
+      # Filled in once the portal has a URL. The browser opens the socket
+      # directly against this API, and that is a cross-origin request.
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: DJANGO_CSRF_TRUSTED_ORIGINS
+        sync: false
+      # Throttles: the production rates, not the relaxed local ones.
+      - key: THROTTLE_LOGIN
+        value: 10/min
+      - key: THROTTLE_ANON
+        value: 30/min
+      - key: THROTTLE_INVITE
+        value: 5/hour
+
+databases:
+  - name: sfm-db
+    plan: free
+    region: singapore
+    # Free Postgres on Render expires after a month. Nothing here is the system
+    # of record yet — the field data still lives on the office machine — but
+    # that date is the reason this is a demo deployment and not a migration.
+    postgresMajorVersion: "16"

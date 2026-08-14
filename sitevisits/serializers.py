@@ -5,11 +5,15 @@ The read payloads follow the Flutter client's own models — `check_in_at`,
 — so nothing has to be translated on the way in.
 """
 
+import secrets
 from datetime import timedelta
 
 from django.conf import settings
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema_serializer
 from rest_framework import serializers
+
+from customers.models import PINCODE_PATTERN, Customer
 
 from .models import (
     Site,
@@ -66,6 +70,102 @@ class SiteSerializer(serializers.ModelSerializer):
             'address': obj.address or None,
             'accuracy': None,
         }
+
+
+class SiteCreateSerializer(serializers.Serializer):
+    """Registering a project site against a customer.
+
+    `customer_id` is resolved against the customers table rather than trusted:
+    `Site.customer_ref` is plain text, so an unchecked id would let a typo
+    create a site belonging to nobody, and the name copied alongside it would
+    be whatever the caller said it was.
+    """
+
+    name = serializers.CharField(max_length=150)
+    customer_id = serializers.UUIDField()
+    stage = serializers.ChoiceField(choices=SiteStage.choices)
+    address = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    city = serializers.CharField(max_length=80)
+    pincode = serializers.CharField(max_length=6)
+    contact_person = serializers.CharField(
+        max_length=120, required=False, allow_blank=True
+    )
+    contact_phone = serializers.CharField(
+        max_length=16, required=False, allow_blank=True
+    )
+    estimated_value = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
+    expected_closure = serializers.DateField(required=False, allow_null=True)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+
+    # Optional: a site added while standing on it can carry the fix, which is
+    # what later check-ins get measured against.
+    latitude = serializers.DecimalField(
+        max_digits=9, decimal_places=6, required=False, allow_null=True
+    )
+    longitude = serializers.DecimalField(
+        max_digits=9, decimal_places=6, required=False, allow_null=True
+    )
+
+    def validate_customer_id(self, value):
+        customer = Customer.objects.filter(pk=value, is_active=True).first()
+        if customer is None:
+            raise serializers.ValidationError(
+                'No such customer — register the customer first.'
+            )
+        return customer
+
+    def validate_pincode(self, value):
+        pincode = value.strip()
+        if not PINCODE_PATTERN.match(pincode):
+            raise serializers.ValidationError('Enter a valid 6-digit PIN code.')
+        return pincode
+
+    def validate(self, attrs):
+        customer = attrs['customer_id']
+        name = attrs['name'].strip()
+
+        if Site.objects.filter(
+            customer_ref=str(customer.pk), name__iexact=name
+        ).exists():
+            raise serializers.ValidationError(
+                {'name': f'{customer.name} already has a site called {name}.'}
+            )
+
+        # A fix is a pair or it is nothing — half of one plots the site on the
+        # equator.
+        has_lat = attrs.get('latitude') is not None
+        has_lng = attrs.get('longitude') is not None
+        if has_lat != has_lng:
+            raise serializers.ValidationError(
+                {'latitude': 'Send both latitude and longitude, or neither.'}
+            )
+
+        attrs['name'] = name
+        return attrs
+
+    def create(self, validated_data):
+        customer = validated_data.pop('customer_id')
+        user = self.context['request'].user
+
+        # `Site.code` is unique and has no default — until now every site came
+        # from the seed or the admin, where a human typed one. Random for the
+        # same reason customer codes are: no counter, no lock, and the unique
+        # index still has the last word. Not the head of a UUIDv7, which is a
+        # timestamp and therefore identical across rows written together.
+        code = f'SITE-{secrets.token_hex(4).upper()}'
+
+        return Site.objects.create(
+            code=code,
+            customer_ref=str(customer.pk),
+            # Copied, not referenced — `customer_ref` is text until the
+            # foreign-key migration lands, and a site card has to render
+            # without a second query.
+            customer_name=customer.name,
+            territory=getattr(user, 'primary_territory', None),
+            **validated_data,
+        )
 
 
 class SiteVisitImageSerializer(serializers.ModelSerializer):
@@ -223,6 +323,7 @@ class GpsFieldsSerializer(serializers.Serializer):
         return attrs
 
 
+@extend_schema_serializer(component_name='SiteVisitCheckIn')
 class CheckInSerializer(GpsFieldsSerializer):
     """Opens a visit."""
 
@@ -241,6 +342,7 @@ class CheckInSerializer(GpsFieldsSerializer):
         return value
 
 
+@extend_schema_serializer(component_name='SiteVisitCheckOut')
 class CheckOutSerializer(GpsFieldsSerializer):
     """Closes a visit, and carries what the visit found."""
 

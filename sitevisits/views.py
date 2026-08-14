@@ -8,8 +8,15 @@ had a hand in.
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
-from rest_framework.generics import GenericAPIView, ListAPIView, RetrieveAPIView
+from rest_framework.generics import (
+    GenericAPIView,
+    ListAPIView,
+    ListCreateAPIView,
+    RetrieveAPIView,
+)
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -22,6 +29,7 @@ from .serializers import (
     CancelVisitSerializer,
     CheckInSerializer,
     CheckOutSerializer,
+    SiteCreateSerializer,
     SiteSerializer,
     SiteVisitImageSerializer,
     SiteVisitSerializer,
@@ -32,22 +40,57 @@ VISIT_QUERYSET = SiteVisit.objects.select_related('site', 'user').prefetch_relat
 )
 
 
-class SiteListView(ListAPIView):
-    """The project sites available to call on.
+class SiteListView(ListCreateAPIView):
+    """The project sites available to call on, and the way to register one.
 
     **Query** `search` matches the site name, its code or the customer.
+    `customer_id` narrows the list to one customer's sites.
+
+    Reads stay open to any signed-in user — a site is somewhere to visit, not
+    a private record. Registering one needs `onboard_customers`, the same
+    permission that gates adding the customer it belongs to.
 
     **Responses**
     * `200` — a paginated list
+    * `201` — the site, in the same shape a list entry has
+    * `400` — a field failed validation, keyed by field name
     * `401` — missing or invalid access token
+    * `403` — the role does not allow onboarding
     """
 
-    serializer_class = SiteSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasBusinessPermission]
     search_fields = ['name', 'code', 'customer_name', 'city']
 
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return SiteCreateSerializer
+        return SiteSerializer
+
+    @property
+    def required_permission(self):
+        # The read is deliberately ungated; only the write is.
+        return 'onboard_customers' if self.request.method == 'POST' else None
+
     def get_queryset(self):
-        return Site.objects.filter(is_active=True)
+        queryset = Site.objects.filter(is_active=True)
+
+        customer_id = self.request.query_params.get('customer_id', '').strip()
+        if customer_id:
+            queryset = queryset.filter(customer_ref=customer_id)
+
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        site = serializer.save()
+
+        # Answered with the read serializer, so a site that was just created
+        # and a site off the list are the same object to the client.
+        return Response(
+            SiteSerializer(site, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class SiteVisitListView(ListAPIView):
@@ -98,6 +141,10 @@ class SiteVisitDetailView(RetrieveAPIView):
     queryset = VISIT_QUERYSET
 
 
+@extend_schema(
+    responses={200: OpenApiTypes.OBJECT},
+    summary='The visit currently in progress',
+)
 class OpenVisitView(APIView):
     """The visit the user is in the middle of, or `null`.
 
@@ -322,6 +369,10 @@ class AddImageView(GenericAPIView):
         )
 
 
+@extend_schema(
+    responses={200: OpenApiTypes.OBJECT},
+    summary='Remove a visit photo',
+)
 class RemoveImageView(APIView):
     """Remove a photo from an open visit.
 

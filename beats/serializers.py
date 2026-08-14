@@ -5,6 +5,9 @@ Payload keys follow the Flutter client's `BeatModel` and `BeatPlanModel`:
 `planned_outlet_count`, `covered_customer_ids`.
 """
 
+from datetime import timedelta
+
+from django.conf import settings
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -85,7 +88,19 @@ class BeatPlanSerializer(serializers.ModelSerializer):
     beat_id = serializers.CharField(source='beat.id', read_only=True)
     beat_name = serializers.CharField(source='beat.name', read_only=True)
     beat_code = serializers.CharField(source='beat.code', read_only=True)
+    beat_area = serializers.CharField(source='beat.area', read_only=True)
+    beat_city = serializers.CharField(source='beat.city', read_only=True)
+    # The zone the route belongs to, and who is running it. Both are
+    # already on the related rows; the detail panel had no way to show
+    # them because they were never serialised.
+    territory = serializers.CharField(
+        source='beat.territory.name', read_only=True, default=''
+    )
     user_id = serializers.CharField(source='user.id', read_only=True)
+    user_name = serializers.CharField(source='user.full_name', read_only=True)
+    user_code = serializers.CharField(
+        source='user.employee_code', read_only=True
+    )
     covered_customer_ids = serializers.SerializerMethodField()
     visits = BeatPlanVisitSerializer(many=True, read_only=True)
     covered_count = serializers.IntegerField(read_only=True)
@@ -100,7 +115,12 @@ class BeatPlanSerializer(serializers.ModelSerializer):
             'beat_id',
             'beat_name',
             'beat_code',
+            'beat_area',
+            'beat_city',
+            'territory',
             'user_id',
+            'user_name',
+            'user_code',
             'date',
             'status',
             'planned_outlet_count',
@@ -191,8 +211,75 @@ class MarkVisitedSerializer(serializers.Serializer):
     visited_at = serializers.DateTimeField(required=False)
 
     def validate_visited_at(self, value):
-        if value > timezone.now():
+        # The same tolerance attendance and site visits allow, rather than the
+        # zero this used to demand. Both timestamps come from the same handset
+        # and mean the same thing, and a phone whose clock is a minute ahead of
+        # the server — which is every phone, sooner or later — was being told
+        # its visit happened in the future. What the check is for is a clock
+        # that is wrong by hours, not by the drift between two machines nobody
+        # is synchronising.
+        skew = timedelta(minutes=settings.ATTENDANCE_CLOCK_SKEW_MINUTES)
+        if value > timezone.now() + skew:
             raise serializers.ValidationError(
                 'This visit is in the future. Check the device clock.'
             )
         return value
+
+
+class BulkPlanSerializer(serializers.Serializer):
+    """Schedules several beats onto one day in a single call.
+
+    Multi-select on the planning screen would otherwise be N round trips, and
+    a half-applied selection with no way to tell which half — the caller gets
+    one answer per beat instead, applied or refused with a reason.
+
+    Every beat still goes through `BeatPlanCreateSerializer`, so the rules an
+    individual plan obeys — inactive beat, empty route, a date in the past,
+    somebody else's beat — hold here unchanged rather than being restated.
+    """
+
+    beats = serializers.ListField(
+        child=serializers.PrimaryKeyRelatedField(queryset=Beat.objects.all()),
+        allow_empty=False,
+        max_length=50,
+    )
+    date = serializers.DateField()
+    remarks = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_beats(self, value):
+        # The same beat twice in one request is a client bug, and letting it
+        # through would report one success and one "already planned".
+        if len({beat.pk for beat in value}) != len(value):
+            raise serializers.ValidationError('The same beat is listed twice.')
+        return value
+
+
+class BulkStartSerializer(serializers.Serializer):
+    """Starts several plans at once."""
+
+    plans = serializers.ListField(
+        child=serializers.UUIDField(),
+        allow_empty=False,
+        max_length=50,
+    )
+
+    def validate_plans(self, value):
+        if len(set(value)) != len(value):
+            raise serializers.ValidationError('The same plan is listed twice.')
+        return value
+
+
+class BulkResultSerializer(serializers.Serializer):
+    """One row per item, so a partly-applied batch is legible."""
+
+    id = serializers.CharField()
+    status = serializers.CharField()
+    detail = serializers.CharField(required=False, allow_blank=True)
+    plan = BeatPlanSerializer(required=False, allow_null=True)
+
+
+class BulkResponseSerializer(serializers.Serializer):
+    requested = serializers.IntegerField()
+    applied = serializers.IntegerField()
+    failed = serializers.IntegerField()
+    results = BulkResultSerializer(many=True)

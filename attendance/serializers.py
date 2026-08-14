@@ -10,6 +10,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema_serializer
 from rest_framework import serializers
 
 from .models import Attendance, GeoFence
@@ -176,9 +177,11 @@ class PunchSerializer(serializers.Serializer):
         return attrs
 
 
+@extend_schema_serializer(component_name='AttendanceCheckIn')
 class CheckInSerializer(PunchSerializer):
     """Starts the working day."""
 
 
+@extend_schema_serializer(component_name='AttendanceCheckOut')
 class CheckOutSerializer(PunchSerializer):
     """Closes the working day."""

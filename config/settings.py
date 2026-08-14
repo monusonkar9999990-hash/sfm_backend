@@ -67,14 +67,24 @@ def env_list(key, default=''):
 # Core
 # --------------------------------------------------------------------------
 
-DEBUG = env_bool('DJANGO_DEBUG', True)
+# Off unless something says otherwise.
+#
+# The default used to be True, which fails open: a deployment that forgets
+# DJANGO_DEBUG gets tracebacks containing settings on every 500, ALLOWED_HOSTS
+# effectively disabled, and — because the SECRET_KEY guard below only fires
+# when DEBUG is off — every token signed with the development key printed in
+# this file. Forgetting a variable should cost a clear error at start-up, not a
+# silent downgrade in production. Local development sets DJANGO_DEBUG=True in
+# .env; see .env.example.
+DEBUG = env_bool('DJANGO_DEBUG', False)
 
 SECRET_KEY = env('DJANGO_SECRET_KEY', '')
 if not SECRET_KEY:
     if not DEBUG:
         # Refuse to start rather than sign tokens with a guessable key.
         raise ImproperlyConfigured(
-            'DJANGO_SECRET_KEY must be set when DJANGO_DEBUG is off.'
+            'DJANGO_SECRET_KEY must be set when DJANGO_DEBUG is off. '
+            'For local development, copy .env.example to .env.'
         )
     SECRET_KEY = 'django-insecure-local-development-key-do-not-deploy'
 
@@ -84,6 +94,19 @@ ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,[::1]')
 
 # Needed for the admin login form once the API sits behind a domain.
 CSRF_TRUSTED_ORIGINS = env_list('DJANGO_CSRF_TRUSTED_ORIGINS')
+
+# The platform names the host it will send traffic to, and it is not knowable
+# before the service exists — which makes it a chicken-and-egg if it has to be
+# typed into a setting by hand. Render publishes it as an environment variable,
+# so it is trusted here rather than being one more thing to remember on the
+# first deploy. Every other host still has to be named explicitly.
+_platform_host = env('RENDER_EXTERNAL_HOSTNAME', '')
+if _platform_host:
+    if _platform_host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_platform_host)
+    origin = f'https://{_platform_host}'
+    if origin not in CSRF_TRUSTED_ORIGINS:
+        CSRF_TRUSTED_ORIGINS.append(origin)
 
 ROOT_URLCONF = 'config.urls'
 WSGI_APPLICATION = 'config.wsgi.application'
@@ -112,6 +135,9 @@ THIRD_PARTY_APPS = [
     # Stores refresh tokens that have been rotated or logged out, so a stolen
     # refresh token can be revoked before it expires.
     'rest_framework_simplejwt.token_blacklist',
+    # Generates the OpenAPI schema from the views and serializers themselves,
+    # so the document cannot drift from the API the way a hand-written one does.
+    'drf_spectacular',
 ]
 
 LOCAL_APPS = [
@@ -119,6 +145,25 @@ LOCAL_APPS = [
     'attendance',
     'beats',
     'sitevisits',
+    'customers',
+    'products',
+    'orders',
+    # Owns no tables — it reads the six modules above. Installed so its tests
+    # are discovered and its app registry entry exists.
+    'reports',
+    # Owns only a ledger: the business data an upload carries is written by
+    # the module that owns it, through that module's own endpoint.
+    'sync',
+    # Labelled `administration`, not `admin` — that label belongs to
+    # django.contrib.admin and Django refuses to start with two apps sharing
+    # one. Its API is still mounted at /api/<version>/admin/.
+    'administration',
+    # The public payloads the app reads before anybody signs in.
+    'appinfo',
+    # Owns no tables either: it watches the modules above and tells the
+    # management portal that something moved. See `realtime/__init__.py` for
+    # why the socket carries no business data.
+    'realtime',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -134,6 +179,14 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+
+    # Both below AuthenticationMiddleware, which is what sets request.user for
+    # session callers. The maintenance gate resolves a bearer token itself for
+    # API callers, since DRF has not authenticated yet at this point.
+    'administration.middleware.MaintenanceModeMiddleware',
+    # Outermost of the two on the way out: it wraps the response so the audit
+    # context is still set while the maintenance gate answers.
+    'administration.middleware.AuditContextMiddleware',
 ]
 
 TEMPLATES = [
@@ -208,8 +261,51 @@ def _mysql_options():
     return options
 
 
+def _database_from_url(url):
+    """A `DATABASE_URL` as Django's `DATABASES['default']`.
+
+    Managed platforms hand out one connection string rather than five separate
+    settings, and Render is one of them. Supported so the same code runs there
+    without a second settings module — and *only* when the variable is set, so
+    a laptop with MySQL in `.env` is unaffected.
+
+    Postgres only, deliberately. Render offers no managed MySQL, and a URL
+    parser that silently accepted `mysql://` here would be claiming a
+    combination nobody has run.
+    """
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {'postgres', 'postgresql'}:
+        raise ImproperlyConfigured(
+            f'DATABASE_URL must be a postgres:// URL, not {parsed.scheme!r}. '
+            'Leave it unset to use the DB_* settings and MySQL.'
+        )
+
+    return {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': (parsed.path or '/').lstrip('/'),
+        'USER': unquote(parsed.username or ''),
+        'PASSWORD': unquote(parsed.password or ''),
+        'HOST': parsed.hostname or '',
+        'PORT': str(parsed.port or ''),
+        'CONN_MAX_AGE': env_int('DB_CONN_MAX_AGE', 60),
+        'CONN_HEALTH_CHECKS': True,
+        'ATOMIC_REQUESTS': env_bool('DB_ATOMIC_REQUESTS', False),
+        # Render refuses an unencrypted connection to its managed Postgres.
+        #
+        # `or 'require'` rather than a default argument: the local `.env` sets
+        # `DB_SSL_MODE=` empty for MySQL, and an empty string is a value — it
+        # would be passed straight through to libpq as a blank sslmode and the
+        # connection would fail somewhere far from here.
+        'OPTIONS': {'sslmode': env('DB_SSL_MODE', '') or 'require'},
+    }
+
+
+DATABASE_URL = env('DATABASE_URL', '')
+
 DATABASES = {
-    'default': {
+    'default': _database_from_url(DATABASE_URL) if DATABASE_URL else {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': env('DB_NAME', 'sfm_db'),
         'USER': env('DB_USER', 'root'),
@@ -328,6 +424,33 @@ REST_FRAMEWORK = {
     'ALLOWED_VERSIONS': ['v1'],
     'DATETIME_FORMAT': 'iso-8601',
     'TEST_REQUEST_DEFAULT_FORMAT': 'json',
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+
+# --------------------------------------------------------------------------
+# OpenAPI
+# --------------------------------------------------------------------------
+# The schema is generated from the views and serializers, so it cannot drift
+# from the API the way a hand-maintained document does. The docstring on each
+# view — the "**Responses**" blocks written throughout this codebase — becomes
+# the endpoint description.
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Sales Force Management API',
+    'DESCRIPTION': (
+        'Field sales backend: attendance, beat plans, site visits, customers, '
+        'products, orders, reporting, offline sync and administration.\n\n'
+        'All endpoints are versioned under `/api/v1/`. Everything except the '
+        'public configuration endpoints (`/privacy/`, `/terms/`, '
+        '`/app-version/`, `/app-config/`, `/announcements/`) requires a JWT '
+        'bearer token from `/api/v1/auth/login/`.'
+    ),
+    'VERSION': '1.0.0',
+    # The schema endpoint should not appear in its own schema.
+    'SERVE_INCLUDE_SCHEMA': False,
+    'SCHEMA_PATH_PREFIX': '/api/v[0-9]',
+    'SERVERS': [{'url': '/', 'description': 'This server'}],
 }
 
 
@@ -387,6 +510,15 @@ CORS_ALLOW_CREDENTIALS = False
 
 
 # --------------------------------------------------------------------------
+# Products
+# --------------------------------------------------------------------------
+# At or below this quantity the catalogue reports a product as low on stock
+# rather than available. Commercial policy, not code — cement moves by the
+# hundred and a switchgear line by the dozen, so this is expected to be tuned.
+PRODUCTS_LOW_STOCK_THRESHOLD = env_int('PRODUCTS_LOW_STOCK_THRESHOLD', 25)
+
+
+# --------------------------------------------------------------------------
 # Attendance
 # --------------------------------------------------------------------------
 # Field policy, not code: an administrator changes these without a release.
@@ -440,6 +572,18 @@ STATICFILES_DIRS = [BASE_DIR / 'static']
 MEDIA_URL = '/media/'
 MEDIA_ROOT = Path(env('DJANGO_MEDIA_ROOT', str(BASE_DIR / 'media')))
 
+# True on a platform where the application process is also the web server —
+# Render, Fly, a bare container — and there is no nginx in front to serve
+# `staticfiles/`. WhiteNoise then does it, which is what keeps the admin and
+# the API docs from rendering unstyled.
+SERVE_STATIC_FILES = env_bool('SERVE_STATIC_FILES', False)
+
+if SERVE_STATIC_FILES:
+    # Directly after SecurityMiddleware, which is where WhiteNoise documents
+    # it: a static file should be answered without the session, the CORS
+    # headers or the audit log being assembled first.
+    MIDDLEWARE.insert(1, 'whitenoise.middleware.WhiteNoiseMiddleware')
+
 STORAGES = {
     'default': {
         'BACKEND': 'django.core.files.storage.FileSystemStorage',
@@ -449,7 +593,11 @@ STORAGES = {
         'BACKEND': (
             'django.contrib.staticfiles.storage.StaticFilesStorage'
             if DEBUG
-            else 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
+            else (
+                'whitenoise.storage.CompressedManifestStaticFilesStorage'
+                if SERVE_STATIC_FILES
+                else 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
+            )
         ),
     },
 }

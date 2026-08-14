@@ -1,0 +1,106 @@
+# nginx for the SFM API. TEMPLATE — replace every <placeholder>.
+#
+#   sudo cp deploy/nginx.conf.template /etc/nginx/sites-available/sfm-api
+#   sudo ln -s /etc/nginx/sites-available/sfm-api /etc/nginx/sites-enabled/
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Get the certificate first; certbot rewrites the TLS block below to point at
+# the real files:
+#
+#   sudo certbot --nginx -d <your-api-domain>
+
+upstream sfm_backend {
+    server 127.0.0.1:8000 fail_timeout=0;
+}
+
+# Plain HTTP exists only to send everyone to HTTPS and to answer the ACME
+# challenge certbot uses to renew.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name <your-api-domain>;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name <your-api-domain>;
+
+    ssl_certificate     /etc/letsencrypt/live/<your-api-domain>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/<your-api-domain>/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # HSTS is also set by Django. Setting it here as well means it survives a
+    # request Django never sees — a 502 while gunicorn restarts, say.
+    add_header Strict-Transport-Security "max-age=2592000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+
+    # Site photos and selfies come off a phone camera. The default 1m would
+    # reject them, and a sync batch carries several at once.
+    client_max_body_size 25m;
+    client_body_timeout 120s;
+
+    # Uploaded files. Served by nginx rather than Django, which should never
+    # be in the business of streaming bytes off disk.
+    #
+    # Must match DJANGO_MEDIA_ROOT.
+    location /media/ {
+        alias <your-media-root>/;
+        expires 7d;
+        add_header Cache-Control "private";
+        # Uploads are user-supplied. Without this an uploaded .html would be
+        # served as HTML from your own origin, which is stored XSS.
+        add_header X-Content-Type-Options "nosniff" always;
+    }
+
+    # collectstatic output. Only the API schema UI and Django admin need it.
+    location /static/ {
+        alias <your-project-path>/staticfiles/;
+        expires 30d;
+        access_log off;
+    }
+
+    # The load balancer's probe. Kept out of the access log so it does not
+    # drown everything else at one request every few seconds.
+    location = /api/v1/health/ {
+        proxy_pass http://sfm_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        access_log off;
+    }
+
+    location / {
+        proxy_pass http://sfm_backend;
+        proxy_http_version 1.1;
+
+        # Django reads X-Forwarded-Proto to know the request arrived over TLS
+        # (SECURE_PROXY_SSL_HEADER). Without it every response redirects to
+        # https forever, because Django believes it is still on http.
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Matches gunicorn's timeout, so neither gives up on a request the
+        # other is still working on.
+        proxy_connect_timeout 10s;
+        proxy_read_timeout    120s;
+        proxy_send_timeout    120s;
+
+        # Let nginx absorb slow clients instead of tying up a gunicorn worker.
+        proxy_request_buffering on;
+    }
+}

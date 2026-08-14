@@ -176,9 +176,17 @@ class RequestInviteView(GenericAPIView):
     endpoint open to the internet that distinguishes those cases is a
     directory of who works here.
 
+    A password may be chosen here. It is hashed before it is stored, it is
+    never echoed back, and it grants nothing on its own — the account still
+    does not exist until an administrator approves the request, and only then
+    does the password become the one that account signs in with. Leaving it
+    out is still valid: the account is then created with a password to be set
+    on first sign-in, exactly as before.
+
     **Request**
     `{"full_name": "…", "employee_code": "SFM-0142", "email": "…",
-      "mobile": "+919876543210", "message": "…"}`
+      "mobile": "+919876543210", "message": "…",
+      "password": "…", "confirm_password": "…"}`
 
     **Responses**
     * `202` — the request was received (whatever happened behind it)

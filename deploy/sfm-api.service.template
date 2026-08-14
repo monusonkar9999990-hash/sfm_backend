@@ -1,0 +1,58 @@
+# systemd unit for the SFM API. TEMPLATE — replace every <placeholder>.
+#
+#   sudo cp deploy/sfm-api.service.template /etc/systemd/system/sfm-api.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sfm-api
+#   sudo systemctl status sfm-api
+#
+# Logs:  sudo journalctl -u sfm-api -f
+
+[Unit]
+Description=Sales Force Management API (gunicorn)
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=notify
+
+# Never root. Create it once with:
+#   sudo useradd --system --home <your-project-path> --shell /usr/sbin/nologin sfm
+User=<your-service-user>
+Group=<your-service-group>
+
+WorkingDirectory=<your-project-path>
+
+# Secrets come from a file root owns and the service user can only read:
+#   sudo chown root:<your-service-group> <your-project-path>/.env
+#   sudo chmod 640 <your-project-path>/.env
+#
+# EnvironmentFile, not Environment=: a value written into the unit is visible
+# to every user on the box through `systemctl show`.
+EnvironmentFile=<your-project-path>/.env
+
+ExecStart=<your-project-path>/venv/bin/gunicorn config.wsgi:application \
+    -c <your-project-path>/config/gunicorn.conf.py
+
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=30
+Restart=always
+RestartSec=5
+
+# Hardening. Each line removes something this process has no business doing,
+# so a flaw in a dependency has less to work with.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# ProtectSystem=strict makes the filesystem read-only, so name the two places
+# that must stay writable: uploaded photos, and collectstatic's output.
+ReadWritePaths=<your-media-root> <your-project-path>/staticfiles
+
+[Install]
+WantedBy=multi-user.target

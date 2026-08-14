@@ -1,10 +1,35 @@
-asgiref==3.12.1
+﻿asgiref==3.12.1
+bidict==0.23.1
 Django==6.0.7
 django-cors-headers==4.9.0
-djangorestframework==3.17.1
 djangorestframework_simplejwt==5.5.1
+djangorestframework==3.17.1
+drf-spectacular==0.30.0
+inflection==0.5.1
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
 mysqlclient==2.2.8
 pillow==12.3.0
+# Postgres, for a managed platform that offers nothing else. MySQL stays the
+# default; the driver is only reached when DATABASE_URL is set.
+psycopg[binary]==3.2.12
+# Serves `staticfiles/` from the application process where there is no nginx
+# in front of it. Off unless SERVE_STATIC_FILES says otherwise.
+whitenoise==6.11.0
 PyJWT==2.13.0
+PyYAML==6.0.3
 sqlparse==0.5.5
 tzdata==2026.3
+uritemplate==4.2.0
+gunicorn==23.0.0
+
+# Live updates for the management portal. `socketio.WSGIApp` sits in front of
+# Django in config/wsgi.py, so the socket and the API share one port and one
+# process — no ASGI move, no second service to run. `simple-websocket` is what
+# lets a WSGI server upgrade a polling connection where it can; where it
+# cannot, Socket.IO stays on long-polling and nothing else changes.
+h11==0.16.0
+python-engineio==4.13.5
+python-socketio==5.16.4
+simple-websocket==1.1.0
+wsproto==1.3.2

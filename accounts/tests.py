@@ -5,6 +5,7 @@ runner — the working schema and its data are never touched.
 """
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import check_password
 from django.contrib.auth.models import Permission
 from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -460,6 +461,120 @@ class InviteRequestTests(APITestCase):
         self.assertEqual(invite.created_user, user)
         self.assertEqual(invite.reviewed_by, self.existing)
         self.assertIsNotNone(invite.reviewed_at)
+
+    # ------------------------------------------------------------- passwords
+
+    CHOSEN = 'Kiran-Pass!42'
+
+    def with_password(self, password=None, confirm=None, **overrides):
+        chosen = self.CHOSEN if password is None else password
+        return self.payload(
+            password=chosen,
+            confirm_password=chosen if confirm is None else confirm,
+            **overrides,
+        )
+
+    def test_a_chosen_password_is_kept_only_as_a_hash(self):
+        response = self.client.post(
+            self.url(), self.with_password(), format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+        invite = InviteRequest.objects.get()
+        self.assertTrue(invite.has_password)
+        self.assertNotEqual(invite.password_hash, self.CHOSEN)
+        self.assertNotIn(self.CHOSEN, invite.password_hash)
+        # A real Django hash, and the one that was typed.
+        self.assertTrue(check_password(self.CHOSEN, invite.password_hash))
+
+        # Still nothing anybody can sign in with, and nothing sent back.
+        self.assertFalse(User.objects.filter(employee_code='SFM-0142').exists())
+        self.assertNotIn(self.CHOSEN, str(response.data))
+        self.assertNotIn('password', response.data)
+
+    def test_a_password_that_does_not_match_its_confirmation_is_refused(self):
+        response = self.client.post(
+            self.url(),
+            self.with_password(confirm='Something-Else!42'),
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('confirm_password', response.data)
+        self.assertFalse(InviteRequest.objects.exists())
+
+    def test_half_a_password_is_refused_rather_than_ignored(self):
+        response = self.client.post(
+            self.url(), self.with_password(confirm=''), format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('confirm_password', response.data)
+        self.assertFalse(InviteRequest.objects.exists())
+
+    def test_a_weak_password_is_refused_by_the_project_rules(self):
+        for weak in ['short1', '12345678', 'password']:
+            cache.clear()
+            with self.subTest(password=weak):
+                response = self.client.post(
+                    self.url(), self.with_password(weak), format='json'
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn('password', response.data)
+        self.assertFalse(InviteRequest.objects.exists())
+
+    def test_a_request_without_a_password_is_still_accepted(self):
+        response = self.client.post(self.url(), self.payload(), format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        invite = InviteRequest.objects.get()
+        self.assertFalse(invite.has_password)
+        self.assertEqual(invite.password_hash, '')
+
+    def test_approving_a_request_that_chose_a_password_lets_them_sign_in(self):
+        self.client.post(self.url(), self.with_password(), format='json')
+        invite = InviteRequest.objects.get()
+
+        user = invite.approve(reviewed_by=self.existing)
+
+        # Approval is still the gate — but what they chose is what they use.
+        self.assertEqual(user.status, User.Status.ACTIVE)
+        self.assertTrue(user.is_active)
+        self.assertTrue(user.has_usable_password())
+        self.assertTrue(user.check_password(self.CHOSEN))
+        self.assertFalse(
+            user.must_change_password,
+            'they chose it themselves, so there is nothing to force a change of',
+        )
+
+        # The whole way in, through the real endpoint.
+        cache.clear()
+        response = self.client.post(
+            reverse('accounts:login', kwargs={'version': 'v1'}),
+            {'identifier': 'SFM-0142', 'password': self.CHOSEN},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
+
+    def test_the_chosen_password_is_no_use_until_it_is_approved(self):
+        self.client.post(self.url(), self.with_password(), format='json')
+        cache.clear()
+
+        response = self.client.post(
+            reverse('accounts:login', kwargs={'version': 'v1'}),
+            {'identifier': 'SFM-0142', 'password': self.CHOSEN},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_rejecting_a_request_throws_the_password_away_with_it(self):
+        self.client.post(self.url(), self.with_password(), format='json')
+        invite = InviteRequest.objects.get()
+
+        invite.reject(reviewed_by=self.existing, note='Not on the HR list')
+
+        self.assertFalse(User.objects.filter(employee_code='SFM-0142').exists())
 
     def test_a_request_cannot_be_reviewed_twice(self):
         self.client.post(self.url(), self.payload(), format='json')

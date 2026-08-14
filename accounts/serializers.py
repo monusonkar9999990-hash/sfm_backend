@@ -8,8 +8,10 @@ mobile client reads.
 import re
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import make_password
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
+from drf_spectacular.utils import extend_schema_serializer
 from rest_framework import serializers
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
@@ -207,6 +209,7 @@ class LogoutSerializer(serializers.Serializer):
         return self.token
 
 
+@extend_schema_serializer(component_name='AuthInviteRequest')
 class InviteRequestSerializer(serializers.Serializer):
     """Validates someone asking to be given an account.
 
@@ -221,6 +224,30 @@ class InviteRequestSerializer(serializers.Serializer):
     mobile = serializers.CharField(max_length=16, required=False, allow_blank=True)
     message = serializers.CharField(
         max_length=1000, required=False, allow_blank=True, default=''
+    )
+
+    # Write-only, and hashed before it is stored. It is never echoed back, it
+    # never reaches a log line, and the account it will belong to does not
+    # exist yet — an administrator still has to approve the request first.
+    #
+    # Optional, so a client that does not ask for one keeps working: the
+    # request is then recorded exactly as it always was, and the account is
+    # created with a password to be set on first sign-in.
+    password = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        max_length=128,
+        trim_whitespace=False,
+        style={'input_type': 'password'},
+    )
+    confirm_password = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        max_length=128,
+        trim_whitespace=False,
+        style={'input_type': 'password'},
     )
 
     def validate_employee_code(self, value):
@@ -243,7 +270,51 @@ class InviteRequestSerializer(serializers.Serializer):
                 {'email': 'Give an email address or a mobile number so we can reply.'}
             )
         attrs['full_name'] = attrs['full_name'].strip()
+        self._validate_password(attrs)
         return attrs
+
+    def _validate_password(self, attrs):
+        """Checks a chosen password against the project's own rules.
+
+        Half a pair is refused rather than quietly ignored: somebody who typed
+        a password and left the confirmation empty has not chosen anything,
+        and recording the request without it would hand them an account whose
+        password is not the one they think it is.
+
+        The rules are `AUTH_PASSWORD_VALIDATORS` — the same set the
+        change-password endpoint enforces — so a password accepted here is one
+        the account can keep.
+        """
+        password = attrs.get('password') or ''
+        confirm = attrs.get('confirm_password') or ''
+        if not password and not confirm:
+            attrs['password'] = ''
+            return
+
+        if not password:
+            raise serializers.ValidationError({'password': 'Choose a password.'})
+        if not confirm:
+            raise serializers.ValidationError(
+                {'confirm_password': 'Type the password once more.'}
+            )
+        if password != confirm:
+            raise serializers.ValidationError(
+                {'confirm_password': 'The two passwords do not match.'}
+            )
+
+        # An unsaved instance, purely so the similarity validator can compare
+        # the password against the name and email that were just given.
+        candidate = User(
+            employee_code=attrs.get('employee_code', ''),
+            full_name=attrs.get('full_name', ''),
+            email=attrs.get('email') or None,
+        )
+        try:
+            # Django's validators raise its own ValidationError, which DRF does
+            # not translate on its own — unwrapped it would surface as a 500.
+            validate_password(password, candidate)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'password': list(exc.messages)})
 
     def record(self):
         """Records the request, unless there is nothing to record.
@@ -272,10 +343,14 @@ class InviteRequestSerializer(serializers.Serializer):
         if InviteRequest.open_for(code, email, mobile) is not None:
             return None
 
+        password = validated_data.get('password') or ''
         return InviteRequest.objects.create(
             full_name=validated_data['full_name'],
             employee_code=code,
             email=email,
             mobile=mobile,
             message=validated_data.get('message', ''),
+            # Hashed here, so the plain text exists only for the length of this
+            # request and is never written anywhere.
+            password_hash=make_password(password) if password else '',
         )

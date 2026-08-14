@@ -19,6 +19,8 @@ from rest_framework.response import Response
 from .models import Beat, BeatPlan, BeatPlanStatus, BeatPlanVisit, VisitStatus
 from .permissions import HasBusinessPermission, IsPlanOwner
 from .serializers import (
+    BulkPlanSerializer,
+    BulkStartSerializer,
     BeatPlanCreateSerializer,
     BeatPlanSerializer,
     BeatSerializer,
@@ -372,3 +374,198 @@ class SkipVisitView(VisitActionView):
 
         self.advance_plan(plan)
         return self.plan_response(plan)
+
+
+class BulkPlanView(GenericAPIView):
+    """Schedule several beats onto one day.
+
+    The planning screen lets somebody tick four routes and assign them at
+    once. Doing that as four requests leaves a half-applied selection when the
+    third fails, and nothing on the client can tell which two landed.
+
+    So each beat is applied independently and reported independently: the
+    response carries one row per beat, and `applied` plus `failed` add up to
+    `requested`. A beat already planned for that day is a `skipped` row, not
+    an error that abandons the rest.
+
+    Every beat still goes through `BeatPlanCreateSerializer`. The rules are
+    not restated here — an inactive beat, an empty route, a date in the past
+    or somebody else's beat is refused exactly as it is for a single plan.
+
+    **Request** `{"beats": ["<uuid>", ...], "date": "2026-08-15"}`
+
+    **Responses**
+    * `200` — every beat was considered; read `results` for what happened
+    * `400` — the request itself was malformed, or the list was empty
+    * `401` / `403` — as for a single plan
+    """
+
+    permission_classes = [IsAuthenticated, HasBusinessPermission]
+    required_permission = 'plan_beats'
+    serializer_class = BulkPlanSerializer
+    http_method_names = ['post', 'options']
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        results = []
+        for beat in data['beats']:
+            # Re-validated one at a time through the single-plan serializer,
+            # so a beat this user may not plan is refused with that
+            # serializer own message rather than a second copy of the rule.
+            single = BeatPlanCreateSerializer(
+                data={
+                    'beat': str(beat.pk),
+                    'date': data['date'].isoformat(),
+                    'remarks': data.get('remarks', ''),
+                },
+                context={'request': request},
+            )
+            if not single.is_valid():
+                results.append(
+                    {
+                        'id': str(beat.pk),
+                        'status': 'rejected',
+                        'detail': _first_error(single.errors),
+                    }
+                )
+                continue
+
+            plan = BeatPlan(
+                beat=beat,
+                user=request.user,
+                date=data['date'],
+                remarks=data.get('remarks', ''),
+            )
+            try:
+                # Its own savepoint. Without one an IntegrityError poisons the
+                # surrounding transaction and every later beat in the loop
+                # fails with a message about the atomic block rather than
+                # about the data.
+                with transaction.atomic():
+                    plan.save()
+                    plan.snapshot_outlets()
+                    plan.save(update_fields=['planned_outlet_count'])
+            except IntegrityError:
+                results.append(
+                    {
+                        'id': str(beat.pk),
+                        'status': 'skipped',
+                        'detail': 'Already planned for that day.',
+                    }
+                )
+                continue
+
+            results.append(
+                {
+                    'id': str(beat.pk),
+                    'status': 'applied',
+                    'detail': '',
+                    'plan': BeatPlanSerializer(
+                        plan, context={'request': request}
+                    ).data,
+                }
+            )
+
+        applied = sum(1 for row in results if row['status'] == 'applied')
+        return Response(
+            {
+                'requested': len(results),
+                'applied': applied,
+                'failed': len(results) - applied,
+                'results': results,
+            }
+        )
+
+
+class BulkStartView(GenericAPIView):
+    """Start several plans at once.
+
+    Same shape and the same reasoning as `BulkPlanView`: one row per plan, a
+    closed plan reported as `skipped` rather than failing the batch, and an
+    already-running plan treated as applied because starting one twice is not
+    a mistake a phone can tell apart from a retry.
+
+    **Request** `{"plans": ["<uuid>", ...]}`
+
+    **Responses** `200` · `400` · `401` · `403`
+    """
+
+    permission_classes = [IsAuthenticated, HasBusinessPermission]
+    required_permission = 'plan_beats'
+    serializer_class = BulkStartSerializer
+    http_method_names = ['post', 'options']
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        wanted = serializer.validated_data['plans']
+
+        # One query for the lot, scoped to this user: a plan somebody else
+        # owns simply is not found, which is the same answer the single-plan
+        # endpoint gives and says nothing about whether it exists.
+        plans = {
+            str(plan.pk): plan
+            for plan in BeatPlan.objects.filter(user=request.user, pk__in=wanted)
+            .select_related(*PLAN_SELECT)
+            .prefetch_related(*PLAN_PREFETCH)
+        }
+
+        results = []
+        for plan_id in wanted:
+            key = str(plan_id)
+            plan = plans.get(key)
+
+            if plan is None:
+                results.append(
+                    {'id': key, 'status': 'rejected', 'detail': 'No such plan.'}
+                )
+                continue
+
+            if plan.status in {BeatPlanStatus.COMPLETED, BeatPlanStatus.MISSED}:
+                results.append(
+                    {
+                        'id': key,
+                        'status': 'skipped',
+                        'detail': 'This beat plan is already closed.',
+                    }
+                )
+                continue
+
+            if plan.status == BeatPlanStatus.PLANNED:
+                plan.status = BeatPlanStatus.IN_PROGRESS
+                plan.started_at = timezone.now()
+                plan.save(update_fields=['status', 'started_at'])
+
+            results.append(
+                {
+                    'id': key,
+                    'status': 'applied',
+                    'detail': '',
+                    'plan': BeatPlanSerializer(
+                        plan, context={'request': request}
+                    ).data,
+                }
+            )
+
+        applied = sum(1 for row in results if row['status'] == 'applied')
+        return Response(
+            {
+                'requested': len(results),
+                'applied': applied,
+                'failed': len(results) - applied,
+                'results': results,
+            }
+        )
+
+
+def _first_error(errors):
+    """The one sentence worth showing, out of DRF nested error shape."""
+    for value in errors.values():
+        if isinstance(value, list) and value:
+            return str(value[0])
+        if isinstance(value, str):
+            return value
+    return 'That beat could not be planned.'

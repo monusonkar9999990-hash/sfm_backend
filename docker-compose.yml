@@ -1,0 +1,86 @@
+# Production stack: MySQL + the API + nginx.
+#
+#   cp .env.example .env      # then fill it in — see DEPLOYMENT.md
+#   docker compose up -d --build
+#   docker compose logs -f api
+#
+# No secret appears in this file. Everything comes from .env, which is
+# gitignored.
+
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      # Compose reads these from .env. `${VAR:?message}` fails the command
+      # immediately with that message rather than starting MySQL with a blank
+      # password, which is how a database ends up open to the internet.
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${DB_NAME:-sfm_db}
+      MYSQL_USER: ${DB_USER:-sfm_user}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    command:
+      # utf8mb4 throughout: names and remarks contain Devanagari and emoji, and
+      # MySQL's older utf8 is three bytes and cannot store either.
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --transaction-isolation=READ-COMMITTED
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # No `ports:` on purpose. The database is reachable from the api service
+    # over the compose network and from nowhere else; publishing 3306 puts
+    # MySQL on the public internet.
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Overrides whatever .env says, because inside compose the database is
+      # the `db` service, not 127.0.0.1.
+      DB_HOST: db
+      GUNICORN_BIND: 0.0.0.0:8000
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - media:/app/media
+      - static:/app/staticfiles
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v1/health/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Copy nginx.conf.template, fill in the placeholders, save it as
+      # deploy/nginx.conf. That file is gitignored so a real hostname and
+      # certificate paths never land in the repository.
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certbot/conf:/etc/letsencrypt:ro
+      - ./deploy/certbot/www:/var/www/certbot:ro
+      # Served straight off the volumes the api writes to, so Django never
+      # streams a file it could hand to nginx instead.
+      - media:/app/media:ro
+      - static:/app/staticfiles:ro
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  db_data:
+  media:
+  static:

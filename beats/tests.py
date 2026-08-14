@@ -313,6 +313,20 @@ class BeatTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_a_phone_a_minute_ahead_of_the_server_is_still_accepted(self):
+        # Two machines nobody is synchronising drift apart, and the rep holding
+        # the phone cannot do anything about it. The check is meant to catch a
+        # clock that is wrong by hours — it used to refuse one that was wrong
+        # by seconds, which made a correct phone unable to work a beat.
+        plan = self.make_plan()
+        visit = plan.visits.first()
+        response = self.client.post(
+            self.url('visit-mark', pk=plan.pk, visit_pk=visit.pk),
+            {'visited_at': (timezone.now() + timedelta(minutes=2)).isoformat()},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
     def test_a_visit_from_another_plan_is_not_found(self):
         plan = self.make_plan()
         other_plan = BeatPlan.objects.create(
@@ -418,3 +432,202 @@ class BeatTests(APITestCase):
         self.authenticate(self.outsider)
         response = self.client.post(self.url('plan-complete', pk=plan.pk), {}, format='json')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # ------------------------------------------------------------------- bulk
+    #
+    # Multi-select on the planning screen. Doing it as N requests leaves a
+    # half-applied selection when the third fails, with nothing on the client
+    # able to say which two landed.
+
+    def second_beat(self, code='DEL-N-99', **overrides):
+        """Another route of this user, so a selection has something to select."""
+        beat = Beat.objects.create(
+            code=code,
+            name=overrides.pop('name', 'Second route'),
+            area='B',
+            city='Delhi',
+            assigned_user=overrides.pop('assigned_user', self.user),
+            weekdays=[1, 2, 3, 4, 5, 6, 7],
+            **overrides,
+        )
+        BeatOutlet.objects.create(
+            beat=beat, customer_ref='cus-9', customer_name='Ninth shop', sequence=1
+        )
+        return beat
+
+    def bulk(self, beats, when=None, **extra):
+        payload = {
+            'beats': [str(b.pk) for b in beats],
+            'date': str(when or timezone.localdate() + timedelta(days=1)),
+        }
+        payload.update(extra)
+        return self.client.post(self.url('plans-bulk'), payload, format='json')
+
+    def test_bulk_plans_several_beats_in_one_call(self):
+        other = self.second_beat()
+
+        response = self.bulk([self.beat, other])
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['requested'], 2)
+        self.assertEqual(response.data['applied'], 2)
+        self.assertEqual(response.data['failed'], 0)
+        self.assertEqual(BeatPlan.objects.filter(user=self.user).count(), 2)
+
+    def test_bulk_snapshots_outlets_the_same_way_a_single_plan_does(self):
+        other = self.second_beat()
+
+        self.bulk([self.beat, other])
+
+        # A bulk call that skipped the snapshot would create plans with no
+        # stops on them, which is worse than not creating them at all.
+        for plan in BeatPlan.objects.all():
+            self.assertEqual(plan.visits.count(), plan.planned_outlet_count)
+            self.assertGreater(plan.planned_outlet_count, 0)
+
+    def test_bulk_one_bad_beat_does_not_abandon_the_rest(self):
+        inactive = self.second_beat(code='DEL-N-98', name='Retired', is_active=False)
+
+        response = self.bulk([self.beat, inactive])
+
+        self.assertEqual(response.data['applied'], 1)
+        self.assertEqual(response.data['failed'], 1)
+
+        rejected = [r for r in response.data['results'] if r['status'] == 'rejected']
+        # The single-plan serializer message, not a second copy of the rule.
+        self.assertIn('inactive', rejected[0]['detail'].lower())
+
+    def test_bulk_a_beat_already_planned_is_skipped_not_failed(self):
+        other = self.second_beat()
+        tomorrow = timezone.localdate() + timedelta(days=1)
+        self.bulk([self.beat], when=tomorrow)
+
+        response = self.bulk([self.beat, other], when=tomorrow)
+
+        statuses = {r['id']: r['status'] for r in response.data['results']}
+        self.assertEqual(statuses[str(self.beat.pk)], 'skipped')
+        self.assertEqual(statuses[str(other.pk)], 'applied')
+        # The second beat really was created: an IntegrityError on the first
+        # must not poison the transaction the rest of the loop runs in.
+        self.assertTrue(BeatPlan.objects.filter(beat=other, date=tomorrow).exists())
+
+    def test_bulk_refuses_a_date_in_the_past_for_every_beat(self):
+        other = self.second_beat()
+
+        response = self.bulk(
+            [self.beat, other], when=timezone.localdate() - timedelta(days=1)
+        )
+
+        self.assertEqual(response.data['applied'], 0)
+        self.assertEqual(response.data['failed'], 2)
+
+    def test_bulk_refuses_the_same_beat_listed_twice(self):
+        response = self.bulk([self.beat, self.beat])
+
+        # Letting it through would report one success and one "already
+        # planned" for something the user asked for once.
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_bulk_refuses_an_empty_selection(self):
+        response = self.client.post(
+            self.url('plans-bulk'),
+            {'beats': [], 'date': str(timezone.localdate())},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_bulk_refuses_somebody_elses_beat(self):
+        theirs = self.second_beat(code='DEL-S-01', assigned_user=self.colleague)
+
+        response = self.bulk([theirs])
+
+        self.assertEqual(response.data['applied'], 0)
+        self.assertIn('someone else', response.data['results'][0]['detail'].lower())
+
+    def test_bulk_needs_the_planning_permission(self):
+        self.authenticate(self.outsider)
+
+        response = self.bulk([self.beat])
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # --------------------------------------------------------------- bulk start
+
+    def test_bulk_start_moves_a_planned_run_into_progress(self):
+        plan = self.make_plan()
+
+        response = self.client.post(
+            self.url('plans-bulk-start'), {'plans': [str(plan.pk)]}, format='json'
+        )
+
+        plan.refresh_from_db()
+        self.assertEqual(response.data['applied'], 1)
+        self.assertEqual(plan.status, BeatPlanStatus.IN_PROGRESS)
+        self.assertIsNotNone(plan.started_at)
+
+    def test_bulk_start_twice_is_not_an_error(self):
+        plan = self.make_plan()
+        url = self.url('plans-bulk-start')
+        self.client.post(url, {'plans': [str(plan.pk)]}, format='json')
+
+        response = self.client.post(url, {'plans': [str(plan.pk)]}, format='json')
+
+        # A phone that retried cannot tell the difference, so neither does this.
+        self.assertEqual(response.data['applied'], 1)
+
+    def test_bulk_start_skips_a_closed_plan_with_a_reason(self):
+        plan = self.make_plan()
+        plan.status = BeatPlanStatus.COMPLETED
+        plan.save(update_fields=['status'])
+
+        response = self.client.post(
+            self.url('plans-bulk-start'), {'plans': [str(plan.pk)]}, format='json'
+        )
+
+        row = response.data['results'][0]
+        self.assertEqual(row['status'], 'skipped')
+        self.assertIn('already closed', row['detail'].lower())
+
+    def test_bulk_start_does_not_touch_another_users_plan(self):
+        theirs = BeatPlan.objects.create(
+            beat=self.beat, user=self.colleague, date=timezone.localdate()
+        )
+
+        response = self.client.post(
+            self.url('plans-bulk-start'), {'plans': [str(theirs.pk)]}, format='json'
+        )
+
+        # Not 403: saying "forbidden" would confirm the plan exists.
+        row = response.data['results'][0]
+        self.assertEqual(row['status'], 'rejected')
+        self.assertIn('no such plan', row['detail'].lower())
+
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.status, BeatPlanStatus.PLANNED)
+
+    def test_bulk_start_needs_the_planning_permission(self):
+        plan = self.make_plan()
+        self.authenticate(self.outsider)
+
+        response = self.client.post(
+            self.url('plans-bulk-start'), {'plans': [str(plan.pk)]}, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # ------------------------------------------------------- detail panel fields
+
+    def test_a_plan_carries_its_zone_and_who_runs_it(self):
+        plan = self.make_plan()
+
+        response = self.client.get(self.url('plan-detail', pk=plan.pk))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['user_code'], self.user.employee_code)
+        self.assertEqual(response.data['user_name'], self.user.full_name)
+        self.assertEqual(response.data['beat_area'], self.beat.area)
+        self.assertEqual(response.data['beat_city'], self.beat.city)
+        # Present even with no territory set, so the detail panel renders a
+        # blank field rather than crashing on a missing key.
+        self.assertIn('territory', response.data)

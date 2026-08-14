@@ -167,6 +167,11 @@ class BusinessPermission(models.Model):
             ('manage_roles', 'Edit roles and permissions'),
             ('edit_master_data', 'Edit master data'),
             ('edit_configuration', 'Change app configuration'),
+            # Added with the administration module. Appended rather than
+            # slotted in: the list is a published contract and the client
+            # resolves codenames by name, so order is free but renaming is not.
+            ('approve_registrations', 'Approve or reject invite requests'),
+            ('view_audit_logs', 'Read the audit trail'),
         ]
 
 
@@ -551,6 +556,18 @@ class InviteRequest(TimeStampedUUIDModel):
         help_text='Anything the requester wants the administrator to know.',
     )
 
+    # The password the requester chose, already hashed by Django's password
+    # hasher before it ever reaches this column. Never plain text: the
+    # serializer hashes it on the way in, nothing reads it back out, and
+    # `editable=False` keeps it off every ModelForm including the admin's.
+    #
+    # Optional, because it always was: an administrator can still approve
+    # somebody who never chose one, and that account is created exactly as it
+    # was before — no usable password, and one to be set on first sign-in.
+    password_hash = models.CharField(
+        max_length=128, blank=True, default='', editable=False
+    )
+
     status = models.CharField(
         max_length=10, choices=Status, default=Status.PENDING
     )
@@ -594,6 +611,30 @@ class InviteRequest(TimeStampedUUIDModel):
     def is_pending(self):
         return self.status == self.Status.PENDING
 
+    @property
+    def has_password(self):
+        """Whether the requester chose their own password."""
+        return bool(self.password_hash)
+
+    def adopt_password(self, user):
+        """Gives [user] the password the requester chose, if they chose one.
+
+        The hash is copied across as it stands. It was produced by Django's
+        hasher when the request came in, so running `set_password` here would
+        hash the hash and lock the account out of itself.
+
+        Somebody who picked their own password has nothing to be forced to
+        change on first sign-in, so that flag comes off with it.
+
+        Returns whether a password was actually set.
+        """
+        if not self.password_hash:
+            return False
+        user.password = self.password_hash
+        user.must_change_password = False
+        user.save(update_fields=['password', 'must_change_password'])
+        return True
+
     def save(self, *args, **kwargs):
         self.employee_code = self.employee_code.strip().upper()
         self.full_name = self.full_name.strip()
@@ -617,11 +658,17 @@ class InviteRequest(TimeStampedUUIDModel):
 
     @transaction.atomic
     def approve(self, reviewed_by=None, note=''):
-        """Turns the request into an invited user.
+        """Turns the request into a user.
 
-        The account is created with an unusable password, which is exactly the
-        state `create_user` leaves an invited user in — they set one through
-        the invite, nobody sets one for them.
+        Where the requester chose their own password, the account is created
+        active and carries that password across, so they can sign in with what
+        they typed — approval is still the gate, it just no longer discards
+        what they chose.
+
+        Where they did not, nothing changes: the account is created invited,
+        with an unusable password, which is the state `create_user` leaves an
+        invited user in. They set one through the invite; nobody sets it for
+        them.
         """
         if not self.is_pending:
             raise ValidationError('This request has already been reviewed.')
@@ -633,8 +680,9 @@ class InviteRequest(TimeStampedUUIDModel):
             email=self.email or None,
             mobile=self.mobile or None,
             password=None,
-            status=User.Status.INVITED,
+            status=User.Status.ACTIVE if self.has_password else User.Status.INVITED,
         )
+        self.adopt_password(user)
 
         self.status = self.Status.APPROVED
         self.reviewed_by = reviewed_by

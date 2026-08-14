@@ -18,6 +18,16 @@ staticfiles/
 media/
 *.log
 
+# The portal's compiled front-end: ~43MB of `flutter build web` output, rebuilt
+# from the Flutter project by its scripts/build-portal.ps1. The views and the
+# routes that serve it are committed; the build artefact is not.
+portal/web/
+
 # Editors
 .idea/
 .vscode/
+
+# Filled-in deployment config: contains the real hostname and cert paths.
+deploy/nginx.conf
+deploy/*.service
+deploy/certbot/

@@ -9,6 +9,8 @@ phone cannot recover from.
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.generics import GenericAPIView, ListAPIView
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -192,6 +194,10 @@ class CheckOutView(GenericAPIView):
         )
 
 
+@extend_schema(
+    responses={200: OpenApiTypes.OBJECT},
+    summary="Today's attendance record",
+)
 class TodayAttendanceView(APIView):
     """Today's record for the signed-in user, or `null` before the first punch.
 
