@@ -75,10 +75,21 @@ python manage.py collectstatic --noinput --clear
 echo "==> Checking deployment configuration"
 # Fails the start-up if DEBUG is on or a security setting is missing, so a
 # misconfigured container never reaches the load balancer.
-python manage.py check --deploy --fail-level WARNING || {
-    echo "!! Deployment checks reported problems. Refusing to start."
+#
+# `--tag security` is what keeps that promise narrow enough to keep. Without
+# it, `--fail-level WARNING` fails on *every* warning any app registers — and
+# the first deployment to a managed platform was refused by four notes from
+# the OpenAPI generator about enum naming collisions in the documentation.
+# Refusing to serve the field team over a schema component's name is not the
+# trade this guard was written to make.
+python manage.py check --deploy --fail-level WARNING --tag security || {
+    echo "!! Security checks reported problems. Refusing to start."
     exit 1
 }
+
+# Everything else is reported and does not block. Warnings still belong in the
+# log — they are simply not grounds for keeping the service down.
+python manage.py check --deploy || true
 
 echo "==> Starting: $*"
 exec "$@"
