@@ -7,7 +7,8 @@ The admin stays on its own prefix so it is never versioned with the API.
 from django.conf import settings
 from django.conf.urls.static import static
 from django.contrib import admin
-from django.urls import include, path
+from django.http import JsonResponse
+from django.urls import include, path, reverse
 
 from drf_spectacular.views import (
     SpectacularAPIView,
@@ -17,7 +18,36 @@ from drf_spectacular.views import (
 
 from reports.views import DashboardView
 
+def index(request):
+    """What this host is, and where to go from here.
+
+    The root had no route, so opening the bare hostname answered 404 — which
+    reads as "the deployment is broken" to anybody who has just been handed the
+    URL, and is the first thing anybody tries. There is no HTML application at
+    this origin (the management portal is a separate deployment), so this says
+    so and points at the three places that do answer.
+    """
+    return JsonResponse(
+        {
+            'service': 'SFM API',
+            'status': 'ok',
+            'docs': request.build_absolute_uri(reverse('swagger-ui')),
+            'schema': request.build_absolute_uri(reverse('schema')),
+            'admin': request.build_absolute_uri('/admin/'),
+            'health': request.build_absolute_uri(
+                reverse('appinfo:health', kwargs={'version': 'v1'})
+            ),
+            'note': (
+                'This host serves the API. The management portal is deployed '
+                'separately; the mobile app talks to /api/v1/.'
+            ),
+        }
+    )
+
+
 urlpatterns = [
+    path('', index, name='index'),
+
     path('admin/', admin.site.urls),
 
     # The web portal: the same Flutter application, built for the browser.
