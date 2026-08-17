@@ -2,10 +2,29 @@
 
 Sort String Solution · API for `com.sortstringsolution.salesforcemanagement` 1.4.0
 
-Two routes are prepared. Pick one; they are alternatives, not steps.
+Three routes are prepared. Pick one; they are alternatives, not steps.
 
 - **A — Linux VPS**: gunicorn + nginx + systemd. Most control, most steps.
 - **B — Docker Compose**: the same stack in containers. Fewer steps, needs Docker on the host.
+- **C — Render** (see the end of this file): the Dockerfile on a managed
+  platform, with managed Postgres instead of MySQL. Fewest steps, least
+  control. This is what is currently running.
+
+## What is live today
+
+| | |
+|---|---|
+| API | https://sfm-api-a6n1.onrender.com |
+| Admin | https://sfm-api-a6n1.onrender.com/admin/ |
+| Management portal | https://sfm-portal.vercel.app (Vercel, separate project) |
+| Database | Render Postgres `sfm-db`, Singapore, **free plan — expires after a month** |
+| Repository | `github.com/monusonkar9999990-hash/sfm_backend`, branch `main`, auto-deploy on push |
+
+It is a demo deployment, not the system of record. The free database expires,
+the disk is ephemeral — **uploaded selfies and site photos do not survive a
+redeploy** — and the instance sleeps after 15 minutes of no traffic, so the
+first request afterwards takes about a minute. Route A or B, with a disk or an
+object store for `media/`, is what a real one needs.
 
 Whichever you pick, the app cannot ship until the API answers on **HTTPS at a
 real hostname**. The Flutter release build refuses to start against `http://`
@@ -330,4 +349,63 @@ server is not a backup.
 | 413 on a photo upload | `client_max_body_size` in nginx is below the file size |
 | App shows "Update required" | The AppRelease row rejects 1.4.0 — see step 2 |
 | App refuses to start | The release guard: mocks on, or the URL is HTTP or private. The message names each fault |
-| `ImproperlyConfigured: DB_PASSWORD` | `.env` was not read, or `DJANGO_DEBUG` is not `False` |
+| `ImproperlyConfigured: DB_PASSWORD` | `.env` was not read, or `DJANGO_DEBUG` is not `False`. Not required when `DATABASE_URL` is set |
+
+---
+
+## Route C — Render
+
+Managed, and the shortest way to a URL somebody else can open. What it costs:
+Render has no managed MySQL, so this route runs on **Postgres** through
+`DATABASE_URL`; the disk is ephemeral, so `media/` does not survive a redeploy;
+and the free instance sleeps after 15 minutes.
+
+Nothing is MySQL-specific in the code. `DATABASE_URL` switches the engine and
+the driver, and with it unset the DB_* settings and MySQL are unchanged.
+
+### The pieces
+
+* A **Postgres** instance (`sfm-db`), and a **web service** built from the
+  repository's `Dockerfile` — not Render's Python runtime, because
+  `requirements.txt` still carries `mysqlclient`, which needs the MySQL client
+  headers that image does not have.
+* `render.yaml` in the repository root describes both. It can be launched as a
+  Blueprint, or the same shape can be created through the API.
+
+### Environment
+
+Beyond the usual `DJANGO_*` values:
+
+| | |
+|---|---|
+| `DATABASE_URL` | The database's **internal** connection string |
+| `DB_SSL_MODE` | `prefer` — Render's internal endpoint does not offer TLS, and `require` fails the connection |
+| `SERVE_STATIC_FILES` | `True` — there is no nginx here, so WhiteNoise serves `staticfiles/` |
+| `GUNICORN_FORWARDED_ALLOW_IPS` | `*` — the proxy is not on localhost |
+| `GUNICORN_WORKERS` / `GUNICORN_THREADS` | `2` / `8` — threads, because the live-updates socket holds a polling request open for up to 25 seconds |
+| `DJANGO_SUPERUSER_*` | Creates the first administrator on start-up |
+| `CORS_ALLOWED_ORIGINS` | The portal's origin — the browser opens the socket against this API directly |
+
+`PORT` and `RENDER_EXTERNAL_HOSTNAME` are set by the platform and read
+automatically: gunicorn binds `0.0.0.0:$PORT`, and the hostname joins
+`ALLOWED_HOSTS` and `CSRF_TRUSTED_ORIGINS` on its own — it cannot be known
+before the service exists.
+
+### Seeding
+
+`seed_demo` refuses to run outside `DEBUG`; its passwords are published in this
+repository. The entrypoint instead runs `ensure_roles` and creates one
+administrator from `DJANGO_SUPERUSER_*`. Everything after that is done through
+the admin or the app.
+
+### Things that went wrong the first time
+
+Recorded because each one cost a deploy, and none of them said so plainly:
+
+| Symptom | Cause |
+|---|---|
+| Thirty "not ready yet" lines, then advice about MySQL | The start-up loop suppressed stderr on every attempt. It now shows the error on the last one — every entry below was found within a minute of that change |
+| `ImproperlyConfigured: DB_PASSWORD` on a Postgres deployment | The MySQL password guard ran before anything read `DATABASE_URL` |
+| `module 'uuid' has no attribute 'uuid7'` | The image was `python:3.13`; every primary key defaults to `uuid.uuid7`, which arrived in 3.14 |
+| Deploy refused after migrations, roles and static all succeeded | `check --deploy --fail-level WARNING` fails on *every* app's warnings, and the OpenAPI generator had four notes about enum naming. It is now scoped to `--tag security` |
+| Portal answered 500 with a URL that looks correct in the log | A byte-order mark at the front of the environment value: `﻿https://…`. `lib/config.ts` now strips it |
